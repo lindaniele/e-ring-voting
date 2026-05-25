@@ -142,9 +142,6 @@ bench/results*.csv
 bench/results*.png
 legacy/data/blocks/
 
-# Internal colleague-onboarding notes (not for distribution)
-docs/
-
 # Chain CLI local state
 *.chain
 chain_data/

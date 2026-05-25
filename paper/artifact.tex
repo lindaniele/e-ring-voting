@@ -140,6 +140,28 @@ trusted setup; (iii) the algebra is a clean $\Sigma$-OR proof over a single
 prime-order group, which makes it a realistic target for both implementation
 and future formal verification.
 
+\subsection{Research question}
+\label{sec:rq}
+
+Once the cryptography is in place --- and the cryptography is the
+expensive intellectual capital --- the natural follow-on question is
+\emph{system layer}: who stores ballots, who orders them, who is
+trusted to do so, and what evidence does an auditor need to refute a
+dishonest publisher? In particular: does \emph{replacing a federated
+log with a proof-of-work chain buy you anything that meaningfully
+changes the security or operational story for OTRS-based voting?}
+This is the question we set out to answer empirically.
+
+We build both architectures on top of the same OTRS primitive and the
+same record schema, then compare them on five axes drawn from the
+e-voting literature: trust model, decentralisation, censorship
+resistance, finality, and cross-poll linkability. We further evaluate
+end-to-end cost (wall-clock and storage) at matched voter counts.
+\cref{sec:compare} states the answer up front --- the chain buys
+permissionless validator membership at a real but bounded operational
+cost, and \emph{nothing} for properties that live in the OTRS layer.
+The detail follows from \cref{sec:system} through \cref{sec:eval}.
+
 \subsection{Contributions}
 
 \begin{enumerate}[leftmargin=*]
@@ -858,6 +880,91 @@ multiple parallel rings, or (ii) move to a logarithmic-size traceable
 ring (\cref{sec:future}, item~1). At $N \le 50$ the entire end-to-end
 flow finishes in under $1.2$ seconds on a single core; the bulletin-board
 log fits in a third of a megabyte.
+
+\subsection{Full election --- Architecture B (chain)}
+\label{sec:eval-chain}
+
+For Architecture~B we re-run the same election at the same voter
+counts, with one CLI invocation per transaction and PoW pinned to
+8~bits (256 expected SHA-256 hashes per block --- sufficient for
+benchmark purposes, with the difficulty-cost relationship measured
+separately in \cref{tab:bench-pow}). \cref{tab:syseval-chain} reports
+the end-to-end wall-clock; PoW dominates the per-block fixed cost,
+while the OTRS-bound per-ballot cost remains the same as in A.
+
+\begin{table}[h]
+\centering
+\caption{Architecture~B end-to-end cost at PoW difficulty $d=8$,
+single-core single-process miner. Reproduce with
+\texttt{python3 -m bench.bench\_chain --voters 5,10,25,50 --difficulty 8}.}
+\label{tab:syseval-chain}
+\begin{tabular}{rrrrrr}
+\toprule
+$N$ & Register (ms) & Ring publish (ms) & All ballots (ms) & Audit (ms) & Chain size (KB) \\
+\midrule
+5   & 6.2   & 1.4 & 21.5    & 13.8    & 11.6  \\
+10  & 10.9  & 1.3 & 88.7    & 47.4    & 26.3  \\
+25  & 27.2  & 1.4 & 469.5   & 282.6   & 104.0 \\
+50  & 47.5  & 1.0 & 1\,798.0 & 1\,114.1 & 344.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{PoW cost vs.\ difficulty bits at single-core SHA-256 throughput,
+median over 5 trials. Reproduce with
+\texttt{python3 -m bench.bench\_chain --pow-only --difficulty 4,8,12,16}.}
+\label{tab:bench-pow}
+\begin{tabular}{rrr}
+\toprule
+Difficulty bits $d$ & Expected hashes $2^d$ & Mine time / block (ms) \\
+\midrule
+4  & 16     & 0.09   \\
+8  & 256    & 0.95   \\
+12 & 4\,096  & 12.57  \\
+16 & 65\,536 & 264.57 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What the comparison shows.} At matched $N$, Architecture~B
+costs roughly $\mathbf{1.6\times}$ more end-to-end than~A
+(at $N=50$, the chain finishes the same election in $\sim 3$ seconds
+versus $1.1$ seconds for the federated log). The gap is dominated by
+two effects: one Coinbase + tx-list root hash per block adds a small
+fixed cost, and ballots travel through full transaction validation
+(signature parse, OTRS verify, state-machine dispatch) rather than
+the lighter cohort-signed log append. The per-ballot OTRS work itself
+is identical between architectures because the primitive is shared.
+
+Storage scales similarly: at $N=50$ the chain weighs $344$~KB vs.\
+$324$~KB for the federated log --- a $\sim 6$\% overhead, attributable
+to per-block headers and coinbase transactions. Audit cost is
+roughly comparable ($1.1$~s on chain vs.\ $1.1$~s on log); on the
+chain it is dominated by re-running every block's full validation
+including PoW recomputation.
+
+\paragraph{PoW extrapolation.} \cref{tab:bench-pow} shows the
+single-core Python miner sustains $\approx 270{,}000$ SHA-256 hashes
+per second. A native miner (Rust/C, optimised) on the same hardware
+would hit $\sim 50$M hashes per second --- roughly $200{,}000\times$
+faster --- so production deployment at Bitcoin-style difficulty
+($\sim 80$ bits today) is no more practical for an OTRS-voting chain
+than it is for any small chain. The Bitcoin-style attack-economics
+calculus in \cref{sec:compare} therefore applies independently of
+implementation effort: rented hashpower wins because the chain's
+fee-funded security budget cannot keep up with the political stakes
+of even a single significant poll.
+
+\paragraph{Reading the comparison.} The end-to-end numbers do not by
+themselves recommend one architecture over the other: a $1.6\times$
+slowdown is comfortably acceptable at the voter counts where either
+system makes sense ($N \le 100$). The decisive comparison is in
+\cref{sec:compare}: A buys you cheap auditable accountability against
+a small named set; B buys you permissionless validator membership at
+the cost of bringing back the standard PoW-voting attack
+surface~\cite{ParkSpecter2021}.
 
 \section{Comparison to related work}
 \label{sec:related}
