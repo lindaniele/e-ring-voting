@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "otrs"
+version = "0.1.0"
+description = "Reference implementation of the Scafuro-Zhang one-time traceable ring signature over Ristretto255."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Daniele Lin" },
+    { name = "Niccolò Pagano" },
+]
+keywords = ["cryptography", "ring-signature", "traceable", "e-voting", "ristretto255"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    # We bind libsodium's Ristretto255 surface directly via cffi (ABI mode)
+    # because PyNaCl 1.5.0 does not export ristretto255 bindings on systems
+    # where libsodium was missing them at build time.
+    "cffi>=1.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "hypothesis>=6.0",
+    "pytest-benchmark>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["otrs*"]
+exclude = ["legacy*", "tests*", "bench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

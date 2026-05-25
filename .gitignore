@@ -136,3 +136,26 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Artifact-specific
+bench/results*.csv
+bench/results*.png
+legacy/data/blocks/
+
+# Internal colleague-onboarding notes (not for distribution)
+docs/
+
+# Chain CLI local state
+*.chain
+chain_data/
+
+# LaTeX build artifacts (keep .tex, .md, .pdf; drop the rest)
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.bbl
+*.blg

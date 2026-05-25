@@ -1,90 +1,315 @@
 # e-ring-voting
-USE THIS AS YOUR RISK. THIS IS A CODE THAT'S BEING STILL WRITTEN
-This is demonstration voting system based on blockchain technology written by @NickP005 and @lindaniele
 
-## Abstract
-Currently electronic voting made in many countries such as Brazil flowered. 
-Electronic voting that uses black boxes that require to be trusted is itself dangerous and susceptible to fraud.
-In countries such Brazil they require the voter to trust the vote will be counted and that their identity will not be 
-associated with their vote. This is not admissible for a vote. 
-This project aims to make a public system that can be verified by anyone for electronic voting based on blockchain
-where anonymity is a must. 
+> A verifiable anonymous voting artifact built on **one-time traceable
+> ring signatures** (Scafuro & Zhang, ESORICS 2021), instantiated over
+> Ristretto255 with RFC 9380 hash-to-curve, with **two interchangeable
+> system-layer architectures** sharing the same cryptographic primitive
+> and record schema.
 
-The blockchain will have a currency that will be given with a fixed reward of 900eVotes for each block. 
-Half of each fee will be given to the miner. 
+This repository is a research artifact: an auditable Python library plus
+a tech-report-style write-up describing the cryptography, both system
+architectures, the threat model, the test suite, and a comparison. It
+is **not** production-ready; see *Security* below.
 
-## Voting procedure
-Here there will be explained the various points of a voting.
+| | |
+|---|---|
+| **Status** | research artifact, v0.4 (two architectures) |
+| **Cryptographic core** | Scafuro–Zhang OTRS over Ristretto255 (`otrs/`) |
+| **Architecture A** | threshold-signed bulletin board + witness federation (`voting/`) |
+| **Architecture B** | proof-of-work chain with eVote ledger and typed transactions (`chain/`) |
+| **Tech report** | [`paper/artifact.md`](paper/artifact.md), [`paper/artifact.tex`](paper/artifact.tex) (PDF in `paper/artifact.pdf`) |
+| **Threat model** | [`paper/threat_model.md`](paper/threat_model.md) |
+| **License** | MIT (the legacy code under `legacy/` retains its original license) |
+| **Authors** | Daniele Lin, Niccolò Pagano |
 
-### Registration on blockchain
-The registration is an important phase in which is 
-decided who can vote and who can't. The list of allowed 
-voters is compiled in this phase. Each single voter
-must have registered inside the blockchain their EC pubkey 
-along with some mandatory parameters such as displayname and 
-some optional parameters which could be an unique identifier. 
-To register this information to the blockchain the voter should 
-sign those informations with the EC pubkey. This packet should then 
-be signed by an address that is willing to pay 1eVote to 
-register this information to blockchain. 
-This benefactor could be the same voter or could be the 
-organisation which is setting up the voting.
+The two architectures answer different questions:
 
-### Collect the voters on private platform
-At this point we suggest to create a simple interface where 
-you ask to proof the identity of the users and then ask to 
-them to provide their public keys and craft a simple proof 
-that "proofs" they own that public key (eg: they could sign 
-a random message). 
+- **A (federated)** — small, named publisher cohort + witnesses,
+  Certificate-Transparency-style. Cheap to operate, finality in
+  seconds, no token economy. Wins when the election has a known
+  accountable authority set.
+- **B (PoW chain)** — permissionless miners, eVote economy, no
+  cohort. Wins when permissionless validator membership is a
+  non-negotiable design constraint, at the cost of probabilistic
+  finality and a rentable-hashpower attack surface for
+  high-stakes polls.
 
-### Reserve the blocks
-After the list of voters is completed, the manager has to 
-publicly submit all the informations about the voting. This 
-information could be really big to fir in a maximum transaction 
-size chunk.
+See [`paper/artifact.md`](paper/artifact.md) § 7 for the head-to-head
+comparison.
 
-The manager will send at first a transaction that includes the 
-following data: preparing idle, votation lease, many partecipants, 
-group size and all the hashes of the chunks of data. 
-According to the information given in this transaction, the manager
-will have to put in forfeit a certain amount of eVotes. Plus
-the manager will have to pay as direct fee 5 eVotes for each data
-chunk.
+## What the system gives you
 
-This transaction will generate a layer 2 blockchain where all the
-preparing and voting will be logged. This L2 will be identified 
-with the below-described transaction hash. The hash will also 
-include the blocknumber. There must not exist two votings with
-the same identifier. If one is presented, will be rejected.
+* **Anonymity inside the ring.** A ballot reveals nothing about which
+  ring member produced it (DDH + ROM).
+* **One-vote-per-voter.** Anyone can publicly detect a double-vote and
+  identify the responsible public key, *without* compromising the
+  anonymity of single-vote voters.
+* **Decentralised publication.** Every bulletin-board entry is co-signed
+  by *t-of-N* cohort members. Liveness against `N − t` unavailable
+  publishers; soundness against `t − 1` corrupted publishers.
+* **Equivocation evidence.** An independent `k-of-M` witness federation
+  co-signs log heads off-band. A malicious cohort majority that splits
+  the log produces publicly verifiable equivocation evidence.
+* **Public verifiability.** Any third party with the bulletin board can
+  recompute the tally and refute a dishonest cohort. The cohort and
+  witness identities are bootstrapped from the genesis entry itself.
+* **Tamper-evidence.** The bulletin board is hash-chained and signed.
 
-#### Difference between fee and forfeit
-The fee, for example the fee of the transaction, is a payment 
-in favour of the miner that mines the block. Meanwhile a 
-forfeit is an amount of eVotes taken (from the manager in this 
-case) which aren't directly given to the miner.
+## What it does **not** give you (yet)
 
-### Push the data chunks
-The data chunks of the voting informations can be sent during
-the preparing idle period, starting directly from the same 
-block in which the reserving transaction took place. The 
-chunks don't need to be signed since the hash already is 
-present on the blockchain. 
+* Receipt-freeness / coercion resistance.
+* Liveness against a *unanimously*-malicious cohort.
+* FROST-aggregated signatures (v0.3 uses a vector of `t` Ed25519 sigs
+  per entry; FROST would compress to 64 bytes — v0.4 work).
+* Defence against compromised voter devices.
+* Post-quantum security.
 
-For each data chunk, depending on the information inside
+See [`paper/threat_model.md`](paper/threat_model.md) for the full breakdown.
 
-### Voting procedure - voting phase
-After the public voting list has been published along
-with the details required the voter will see
-a vote permission alongside with the voting id 
-that is the hash of the special transaction that
-started the voting. \n
-So the voter now reads the in-blockchain vote 
-prompt and expresses anonymously their vote.
+## Install
 
-### Voting procedure - counting the result
-When the voting ends every node computes 
-the votes and determines the exit of the
-democratic vote. Every client that partecipated
-can choose to review who voted and count the votes
-themselves. Plus can verify if the vote ended up
-in the final counting.
+The library binds ``libsodium`` (≥ 1.0.18) directly via ``cffi``.
+
+```sh
+# Debian / Ubuntu
+sudo apt install -y libsodium23 python3-cffi python3-pytest \
+    python3-hypothesis python3-cryptography
+
+# or via pip in a virtualenv (libsodium must already be installed)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+## Quickstart — cryptographic primitive
+
+```python
+from otrs import keygen, sign, verify, trace
+
+issue = b"poll-2026-05-24"
+voters = [keygen() for _ in range(10)]
+ring = [v.pk for v in voters]
+
+sig = sign(voters[3].sk, voters[3].pk, issue, b"yes", ring)
+assert verify(sig, issue, b"yes", ring)
+
+sig2 = sign(voters[3].sk, voters[3].pk, issue, b"no", ring)
+result = trace(issue, ring, b"yes", sig, b"no", sig2)
+print(result.status)          # 'double-sign'
+print(result.culprit_pk)      # voter #3's public key
+```
+
+## Quickstart — Architecture A (federated, 2-of-3 cohort + 2-of-3 witnesses)
+
+```sh
+NOW=$(date +%s)
+
+# generate a 3-publisher cohort and a 3-witness federation
+python3 -m voting.cli cohort-keygen  --size 3 --threshold 2 --out-dir cohort
+python3 -m voting.cli witness-keygen --size 3                --out-dir witnesses
+
+# publish the genesis entry — pins the cohort, threshold, and witnesses
+python3 -m voting.cli setup-cohort --log log.jsonl \
+    --cohort-sks cohort/cohort-0-sk.pem,cohort/cohort-1-sk.pem,cohort/cohort-2-sk.pem \
+    --threshold 2 \
+    --witness-pks witnesses/witness-0-pk.pem,witnesses/witness-1-pk.pem,witnesses/witness-2-pk.pem \
+    --witness-threshold 2 \
+    --title "Decentralised Demo" --options "yes,no" \
+    --registration-close $((NOW-120)) --voting-open $((NOW-60)) --voting-close $((NOW+86400))
+
+# voters register (any 2 cohort members can co-sign each registration)
+for i in 0 1 2; do
+  python3 -m voting.cli voter-keygen --out v$i.json
+  PK=$(python3 -c "import json; print(json.load(open('v$i.json'))['pk_b64'])")
+  python3 -m voting.cli register --log log.jsonl \
+      --cohort-sks cohort/cohort-0-sk.pem,cohort/cohort-1-sk.pem \
+      --voter-pk "$PK" --handle "v$i"
+done
+python3 -m voting.cli publish-ring --log log.jsonl \
+    --cohort-sks cohort/cohort-0-sk.pem,cohort/cohort-1-sk.pem
+
+# ballots — note the cohort subset can rotate per entry
+python3 -m voting.cli vote --log log.jsonl --voter-key v0.json --choice yes \
+    --manager-sk cohort/cohort-0-sk.pem \
+    --cohort-sks cohort/cohort-0-sk.pem,cohort/cohort-2-sk.pem
+python3 -m voting.cli vote --log log.jsonl --voter-key v1.json --choice no \
+    --manager-sk cohort/cohort-1-sk.pem \
+    --cohort-sks cohort/cohort-1-sk.pem,cohort/cohort-2-sk.pem
+
+python3 -m voting.cli close --log log.jsonl \
+    --cohort-sks cohort/cohort-0-sk.pem,cohort/cohort-1-sk.pem
+
+# witnesses independently verify and co-sign the head
+python3 -m voting.cli witness-checkpoint --log log.jsonl \
+    --sk witnesses/witness-0-sk.pem --witness-index 0
+python3 -m voting.cli witness-checkpoint --log log.jsonl \
+    --sk witnesses/witness-1-sk.pem --witness-index 1
+
+# anyone with the log can audit — cohort + witness identities live in the genesis entry
+python3 -m voting.cli audit --log log.jsonl
+```
+
+The `audit` command:
+- verifies the chain (indices, prev-hashes, ≥ t cohort signatures, timestamps);
+- enforces the state machine (Setup → Registration\* → Ring → Ballot\* → Closed → Tally?);
+- OTRS-verifies every ballot against the issue, message, and ring;
+- verifies all witness checkpoints, surfaces any equivocation evidence;
+- recomputes the tally, flags double-voters, refutes any dishonest claimed tally.
+
+It exits non-zero on any failure. For the simple **single-manager** case
+(1-of-1 cohort, no witnesses — the v0.2 model), use `manager-keygen` +
+`setup` instead of `cohort-keygen` + `setup-cohort`.
+
+## Quickstart — Architecture B (PoW chain)
+
+Architecture B uses the same OTRS primitive and the same record schema,
+but stores everything on a SHA-256 proof-of-work chain with an eVote
+ledger. Every CLI call mines a new block, so the chain serialises the
+full demo line-by-line.
+
+```sh
+NOW=$(date +%s)
+
+# accounts (Ed25519, hold eVotes) + voter keypairs (OTRS, sign ballots)
+python3 -m chain.cli account-keygen --out miner.json > /dev/null
+python3 -m chain.cli account-keygen --out alice.json > alice_pk.txt
+python3 -m chain.cli voter-keygen   --out v0.json
+python3 -m chain.cli voter-keygen   --out v1.json
+python3 -m chain.cli voter-keygen   --out v2.json
+
+# genesis funds Alice with 1000 eVotes
+ALICE_PK=$(cat alice_pk.txt)
+python3 -m chain.cli init-chain --chain c.bin --miner miner.json \
+    --allocate "${ALICE_PK}:1000" --timestamp $NOW --difficulty 4
+
+# Alice opens a poll
+EID=$(python3 -m chain.cli setup-poll --chain c.bin --miner miner.json \
+    --creator alice.json --title "Demo" --options "yes,no" \
+    --registration-close $((NOW+100)) --voting-open $((NOW+200)) \
+    --voting-close $((NOW+86400)))
+
+# Alice sponsors three voter registrations
+for i in 0 1 2; do
+  PK=$(python3 -c "import json; print(json.load(open('v$i.json'))['pk_b64'])")
+  python3 -m chain.cli register-voter --chain c.bin --miner miner.json \
+      --sponsor alice.json --election-id $EID \
+      --voter-pk "$PK" --handle "v$i"
+done
+
+# freeze the ring, then voters cast (ballots are anonymous: no Ed25519 sender)
+python3 -m chain.cli publish-ring --chain c.bin --miner miner.json \
+    --creator alice.json --election-id $EID
+python3 -m chain.cli vote --chain c.bin --miner miner.json \
+    --voter v0.json --election-id $EID --choice yes
+python3 -m chain.cli vote --chain c.bin --miner miner.json \
+    --voter v1.json --election-id $EID --choice yes
+python3 -m chain.cli vote --chain c.bin --miner miner.json \
+    --voter v2.json --election-id $EID --choice no
+
+# close after voting_close and audit
+python3 -m chain.cli close-poll --chain c.bin --miner miner.json \
+    --creator alice.json --election-id $EID \
+    --timestamp $((NOW+86401))
+python3 -m chain.cli audit --chain c.bin
+```
+
+The `audit` command re-loads the chain (which re-verifies PoW, every
+Ed25519 signature, every nonce, every balance, the state machine, and
+every OTRS signature), then runs the σ-column tally and prints
+per-poll results. Any double-vote is flagged with the culprit's
+public key, identical to Architecture A's behaviour.
+
+## Repository layout
+
+```
+otrs/        ring-signature library — shared by both architectures
+              ├ group.py     Ristretto255 wrapper
+              ├ hash.py      RFC 9380 hash-to-curve + hash-to-scalar
+              ├ otrs.py      KeyGen / Sign / Verify / Trace
+              └ serialize.py canonical encodings
+voting/       Architecture A — federated bulletin board
+              ├ log.py       threshold-signed bulletin board + pending-entry protocol
+              ├ records.py   election lifecycle records (reused by chain/ too)
+              ├ manager.py   publisher-cohort API
+              ├ voter.py     voter API
+              ├ witness.py   witness federation (head-co-signing checkpoints)
+              ├ auditor.py   public auditor
+              └ cli.py       `evote` command line
+chain/        Architecture B — proof-of-work blockchain
+              ├ block.py     block format + SHA-256 PoW puzzle
+              ├ transactions.py typed transactions (coinbase, transfer, + 6 voting kinds)
+              ├ state.py     account ledger + per-poll state machine
+              ├ mining.py    single-process miner + difficulty adjustment
+              ├ node.py      chain head, append, persist, replay
+              ├ auditor.py   chain auditor (replay + σ-column tally)
+              └ cli.py       `evote-chain` command line
+tests/        pytest suite (127 tests across both architectures)
+bench/        microbenchmarks
+paper/        tech report (Markdown + LaTeX + PDF), threat model, comparison
+legacy/       prior implementation, preserved for reference and critique
+```
+
+## Running tests and benchmarks
+
+```sh
+python3 -m pytest -v                                  # all 127 tests
+python3 -m pytest tests/test_election.py -v           # Architecture A integration
+python3 -m pytest tests/test_chain.py -v              # Architecture B integration
+python3 -m pytest tests/test_otrs.py -v               # cryptography only
+python3 -m bench.bench_otrs --sizes 2,4,8,16,32,64,128
+```
+
+## Security
+
+This is research software.
+
+* The OTRS construction is proved secure in [Scafuro–Zhang 2021] under
+  DDH + ROM, but the **implementation** has not been independently
+  audited.
+* Field and group arithmetic delegate to libsodium (constant-time);
+  Python-level glue is not. Full caveat list lives in
+  [`paper/artifact.md` §5.1](paper/artifact.md#51-known-limitations).
+* The voting system v0.2 is single-publisher: a malicious manager can
+  censor (the affected voter can publicly *prove* censorship, but the
+  protocol does not currently provide a fallback publisher). It does
+  not yet provide receipt-freeness or distributed availability.
+
+Do **not** deploy this in a real election without a code audit, a full
+deployment threat model, and the v0.3 work items addressed.
+
+## Citing
+
+```bibtex
+@inproceedings{scafuro2021otrs,
+  author    = {Alessandra Scafuro and Bihan Zhang},
+  title     = {One-time Traceable Ring Signatures},
+  booktitle = {ESORICS 2021},
+  year      = {2021}
+}
+
+@misc{lin2026eringvoting,
+  author = {Daniele Lin and Niccol{\`o} Pagano},
+  title  = {A Decentralised Verifiable Anonymous Voting System on Top of
+            One-Time Traceable Ring Signatures},
+  year   = {2026},
+  howpublished = {\url{https://github.com/NickP005/e-ring-voting}}
+}
+```
+
+## Open problems
+
+See the paper §10 and the threat-model document. Headlines:
+
+1. **Logarithmic-size traceable rings** (Triptych-style with a trace
+   tag).
+2. **EasyCrypt machine-checked proofs** of OTRS security.
+3. **ProVerif / Tamarin model** of the election protocol (cohort +
+   witnesses + state machine).
+4. **Post-quantum (lattice-based)** OTRS variants.
+5. **Coercion resistance** via JCJ / Civitas-style designated-verifier
+   re-encryption.
+6. **FROST threshold Ed25519**: replace the per-entry vector of t
+   signatures with a single 64-byte aggregated FROST signature.
+7. **Escrowed secondary cohort** for liveness against a unanimously
+   malicious primary cohort.
+8. **Gossip protocol** for log / checkpoint replication across cohort
+   nodes, witnesses, and independent mirrors.
