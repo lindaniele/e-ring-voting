@@ -1,13 +1,13 @@
-DOC := notes
+DOCS := notes eli5
 
 .PHONY: all pdf clean
 
 all: pdf
 
-pdf: $(DOC).pdf
+pdf: $(addsuffix .pdf,$(DOCS))
 
-$(DOC).pdf: $(DOC).tex
-	latexmk -pdf -interaction=nonstopmode -halt-on-error $(DOC).tex
+%.pdf: %.tex
+	latexmk -pdf -interaction=nonstopmode -halt-on-error $<
 
 clean:
 	latexmk -C

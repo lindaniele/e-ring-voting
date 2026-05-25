@@ -17,8 +17,10 @@ is **not** production-ready; see *Security* below.
 | **Cryptographic core** | Scafuro–Zhang OTRS over Ristretto255 (`otrs/`) |
 | **Architecture A** | threshold-signed bulletin board + witness federation (`voting/`) |
 | **Architecture B** | proof-of-work chain with eVote ledger and typed transactions (`chain/`) |
-| **Tech report** | [`paper/artifact.md`](paper/artifact.md), [`paper/artifact.tex`](paper/artifact.tex) (PDF in `paper/artifact.pdf`) |
+| **Tech report** | [`paper/artifact.md`](paper/artifact.md), [`paper/artifact.tex`](paper/artifact.tex) (16-page PDF in `paper/artifact.pdf`) |
 | **Threat model** | [`paper/threat_model.md`](paper/threat_model.md) |
+| **Onboarding notes** | [`docs/notes.tex`](docs/notes.tex) — 25-page colleague-onboarding walk-through (PDF in `docs/notes.pdf`) |
+| **ELI5 explainer** | [`docs/eli5.tex`](docs/eli5.tex) — 9-page plain-English walk-through, no math (PDF in `docs/eli5.pdf`) |
 | **License** | MIT (the legacy code under `legacy/` retains its original license) |
 | **Authors** | Daniele Lin, Niccolò Pagano |
 
