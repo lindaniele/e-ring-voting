@@ -4,8 +4,8 @@ import hashlib
 
 import pytest
 
-from otrs.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
-from otrs.hash import expand_message_xmd, hash_to_group, hash_to_scalar
+from trs.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
+from trs.hash import expand_message_xmd, hash_to_group, hash_to_scalar
 
 
 class TestExpandMessageXmd:

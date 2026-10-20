@@ -5,12 +5,13 @@ The node is a thin object that owns ``(chain, state)`` and exposes
 ``append(block)``. State is rebuilt from the chain on load, so the only
 on-disk artifact is a flat binary stream of blocks (length-prefixed).
 
-Fork resolution is **not** implemented in this prototype — the node
-accepts the chain it is given and rejects blocks that don't extend its
-current tip. A multi-peer node would need a fork-choice rule (heaviest
-chain by cumulative ``2^difficulty``); the math is in
-``chain.block.block_weight`` and ``State.cum_weight``, so adding fork
-resolution later is a small extension.
+There is no peer-to-peer networking in this prototype. The fork-choice
+rule is implemented, though (:meth:`Node.consider`): a competing chain
+replaces ours iff it validates from genesis and has strictly more
+cumulative work, ``sum(2^difficulty)`` — the rule of the legacy node's
+``map_tree``. Because every block's difficulty is checked against the
+adjustment rule, a fork cannot buy weight by claiming a difficulty it did
+not pay for.
 """
 
 from __future__ import annotations
@@ -19,7 +20,14 @@ from pathlib import Path
 from typing import List, Tuple
 
 from chain.block import Block, make_genesis
-from chain.state import ChainParams, DEFAULT_PARAMS, State, StateError, apply_block
+from chain.state import (
+    ChainParams,
+    DEFAULT_PARAMS,
+    State,
+    StateError,
+    apply_block,
+    apply_chain,
+)
 from chain.transactions import Transaction, make_coinbase
 
 
@@ -51,6 +59,20 @@ class Node:
         """Apply ``block`` to the state and add it to the chain on success."""
         apply_block(self.state, block, params=self.params)
         self.chain.append(block)
+
+    def consider(self, chain: List[Block]) -> bool:
+        """
+        Heaviest-chain rule: adopt ``chain`` if it is valid and heavier.
+
+        Returns ``True`` if the node switched. Raises :class:`StateError` if
+        ``chain`` does not validate.
+        """
+        state = apply_chain(chain, params=self.params)
+        if state.cum_weight <= self.state.cum_weight:
+            return False
+        self.chain = list(chain)
+        self.state = state
+        return True
 
     # ----- persistence --------------------------------------------------- #
     def save(self, path: Path) -> None:

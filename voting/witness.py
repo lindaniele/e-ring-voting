@@ -53,7 +53,7 @@ class Checkpoint:
     def signing_preimage(self) -> bytes:
         return b"".join(
             [
-                b"otrs-witness-checkpoint-v1",
+                b"trs-witness-checkpoint-v1",
                 self.log_index.to_bytes(8, "big"),
                 self.head_hash,
                 self.witness_index.to_bytes(4, "big"),

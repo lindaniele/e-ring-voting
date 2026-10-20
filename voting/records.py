@@ -19,6 +19,11 @@ The kinds form a state machine on the bulletin board:
                   → (Ballot*) → VotingClosed → TallyPublication
 
 Any record out of order is a validation error caught by the auditor.
+
+The PoW chain (:mod:`chain`) reuses these records but drives the lifecycle
+from block timestamps instead of RingPublication / VotingClosed entries, and
+additionally understands :class:`KeyTransfer` (moving an anonymous voting
+right into the next round, see :mod:`voting.groups`).
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ class RecordKind(str, enum.Enum):
     REGISTRATION = "voter_registration"
     RING = "ring_publication"
     BALLOT = "ballot"
+    KEY_TRANSFER = "key_transfer"
     CLOSED = "voting_closed"
     TALLY = "tally_publication"
 
@@ -70,7 +76,7 @@ class ElectionSetup:
     """
     Genesis record. Fixes the election parameters once and for all.
 
-    ``election_id`` is the OTRS ``issue`` value — a 32-byte random hex string.
+    ``election_id`` is the TRS ``issue`` value — a 32-byte random hex string.
     It must be unique per election; we recommend deriving it as
     ``SHA-256(cohort_pks[0] || title || created_at)`` but the protocol accepts
     any unique value.
@@ -83,6 +89,19 @@ class ElectionSetup:
     co-sign log heads off-band; ``witness_threshold`` is the k-of-M value
     required for the audit step. Both default to empty / 0 for elections
     that do not require an external witness federation.
+
+    The last three fields carry the deterrence-and-groups design and are
+    only enforced by the PoW chain (the federated board requires defaults):
+
+    * ``group_size`` — voters are split into rings of at least this many
+      members by an unbiasable-by-the-organiser assignment
+      (:func:`voting.groups.assign_groups`). ``0`` means one ring for all.
+    * ``rounds`` — number of voting rounds. In every round but the last a
+      voter may, instead of voting, sign a :class:`KeyTransfer` that moves
+      their voting right to a fresh key in the next round's groups.
+    * ``deposit`` — eVotes locked per registration, refunded after the poll
+      unless the registered key double-signs in round 0, in which case it is
+      burned.
     """
 
     election_id: str  # 64-char hex
@@ -96,6 +115,9 @@ class ElectionSetup:
     threshold: int
     witness_pks_b64: List[str] = field(default_factory=list)
     witness_threshold: int = 0
+    group_size: int = 0
+    rounds: int = 1
+    deposit: int = 0
 
     def to_payload(self) -> bytes:
         return _canon_dump({"kind": RecordKind.SETUP.value, **asdict(self)})
@@ -115,6 +137,9 @@ class ElectionSetup:
                 threshold=int(obj["threshold"]),
                 witness_pks_b64=[str(s) for s in obj.get("witness_pks_b64", [])],
                 witness_threshold=int(obj.get("witness_threshold", 0)),
+                group_size=int(obj.get("group_size", 0)),
+                rounds=int(obj.get("rounds", 1)),
+                deposit=int(obj.get("deposit", 0)),
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RecordError(f"malformed ElectionSetup: {exc}") from exc
@@ -147,6 +172,18 @@ class ElectionSetup:
             )
         if m and len(set(self.witness_pks_b64)) != m:
             raise RecordError("duplicate witness public keys")
+        if self.group_size < 0 or self.group_size == 1:
+            raise RecordError("group_size must be 0 (single ring) or at least 2")
+        if self.rounds < 1:
+            raise RecordError("rounds must be at least 1")
+        if self.rounds > self.voting_close - self.voting_open:
+            raise RecordError("voting window shorter than one second per round")
+        if self.deposit < 0:
+            raise RecordError("deposit must be non-negative")
+
+    def uses_chain_features(self) -> bool:
+        """True if the setup needs groups, rounds or deposits (chain-only)."""
+        return self.group_size != 0 or self.rounds != 1 or self.deposit != 0
 
     # ----- helpers ------------------------------------------------------- #
     def manager_pk_raw(self) -> bytes:
@@ -167,7 +204,7 @@ class ElectionSetup:
 @dataclass(frozen=True)
 class VoterRegistration:
     """
-    A voter's OTRS public key, attested by the publisher cohort.
+    A voter's TRS public key, attested by the publisher cohort.
 
     In v0.3 there is no separate Ed25519 "attestation" field: the cohort's
     threshold signature on the *entry containing this record* is the
@@ -178,10 +215,15 @@ class VoterRegistration:
     The handle is a human-readable identifier (e.g. email or student-id
     hash). Identity-proofing remains out of scope: the cohort is trusted
     to only co-sign registration entries for genuine eligible voters.
+
+    ``pop_sig_b64`` is the voter's proof of possession of the key
+    (:func:`trs.prove_possession` over :meth:`pop_context`). The chain
+    requires it; on the federated board it is checked when present.
     """
 
-    voter_pk_b64: str         # 32-byte Ristretto255 OTRS pk
+    voter_pk_b64: str         # 32-byte Ristretto255 TRS pk
     voter_handle: str
+    pop_sig_b64: str = ""
 
     def to_payload(self) -> bytes:
         return _canon_dump({"kind": RecordKind.REGISTRATION.value, **asdict(self)})
@@ -192,9 +234,14 @@ class VoterRegistration:
             return cls(
                 voter_pk_b64=str(obj["voter_pk_b64"]),
                 voter_handle=str(obj["voter_handle"]),
+                pop_sig_b64=str(obj.get("pop_sig_b64", "")),
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RecordError(f"malformed VoterRegistration: {exc}") from exc
+
+    @staticmethod
+    def pop_context(election_id: str, voter_handle: str) -> bytes:
+        return b"register-v1" + bytes.fromhex(election_id) + voter_handle.encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +255,7 @@ class RingPublication:
     The final, ordered list of voter public keys.
 
     Once published, registration is closed and voting opens. Voters use this
-    *exact* ordered ring (the OTRS encoding is order-sensitive). Auditors
+    *exact* ordered ring (the TRS encoding is order-sensitive). Auditors
     verify the ring is exactly the multiset of attested registrations seen
     so far on the log.
     """
@@ -234,16 +281,19 @@ class RingPublication:
 @dataclass(frozen=True)
 class Ballot:
     """
-    A single OTRS-signed ballot.
+    A single TRS-signed ballot.
 
     The choice must equal one of the strings in ``ElectionSetup.options``.
     The signature is over the message bytes ``"ballot-v1" || choice_utf8``,
-    bound to the election's ``election_id`` (used as the OTRS ``issue``) and
-    the ring from :class:`RingPublication`.
+    under the tag ``(issue_for(election_id, round), ring)`` where the ring is
+    group ``group`` of that round (the whole published ring on the
+    federated board, where ``round`` and ``group`` are always 0).
     """
 
     choice: str
-    otrs_sig_b64: str
+    trs_sig_b64: str
+    round: int = 0
+    group: int = 0
 
     def to_payload(self) -> bytes:
         return _canon_dump({"kind": RecordKind.BALLOT.value, **asdict(self)})
@@ -253,7 +303,9 @@ class Ballot:
         try:
             return cls(
                 choice=str(obj["choice"]),
-                otrs_sig_b64=str(obj["otrs_sig_b64"]),
+                trs_sig_b64=str(obj["trs_sig_b64"]),
+                round=int(obj.get("round", 0)),
+                group=int(obj.get("group", 0)),
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RecordError(f"malformed Ballot: {exc}") from exc
@@ -261,6 +313,49 @@ class Ballot:
     @staticmethod
     def message_for(choice: str) -> bytes:
         return b"ballot-v1" + choice.encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# KeyTransfer                                                                  #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class KeyTransfer:
+    """
+    Spend this round's voting right on a fresh key for the next round.
+
+    Signed under exactly the same tag as a :class:`Ballot` of the same round
+    and group, so a voter who both votes and transfers (or transfers twice)
+    has signed two different messages under one tag and is traced. The new
+    key joins the next round's population and is regrouped there, which
+    widens the anonymity set of its eventual ballot to the union of the
+    origin groups of its new ring.
+    """
+
+    new_pk_b64: str
+    trs_sig_b64: str
+    round: int
+    group: int
+
+    def to_payload(self) -> bytes:
+        return _canon_dump({"kind": RecordKind.KEY_TRANSFER.value, **asdict(self)})
+
+    @classmethod
+    def from_obj(cls, obj: Dict[str, Any]) -> "KeyTransfer":
+        try:
+            return cls(
+                new_pk_b64=str(obj["new_pk_b64"]),
+                trs_sig_b64=str(obj["trs_sig_b64"]),
+                round=int(obj["round"]),
+                group=int(obj["group"]),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise RecordError(f"malformed KeyTransfer: {exc}") from exc
+
+    @staticmethod
+    def message_for(new_pk_raw: bytes) -> bytes:
+        return b"key-transfer-v1" + new_pk_raw
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +424,7 @@ _KIND_TO_CLS = {
     RecordKind.REGISTRATION.value: VoterRegistration,
     RecordKind.RING.value: RingPublication,
     RecordKind.BALLOT.value: Ballot,
+    RecordKind.KEY_TRANSFER.value: KeyTransfer,
     RecordKind.CLOSED.value: VotingClosed,
     RecordKind.TALLY.value: TallyPublication,
 }

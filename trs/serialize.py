@@ -1,5 +1,5 @@
 """
-Canonical wire encoding for OTRS objects.
+Canonical wire encoding for TRS objects.
 
 We keep encoding/decoding in one place so the security-critical hash inputs
 (H0, H1, H2 transcripts) are derived from a single canonical byte layout. All
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Sequence
 
-from otrs.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
+from trs.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
 
 LENGTH_PREFIX_BYTES = 4
 MAX_RING_SIZE = 65535  # generous; the scheme itself has no protocol-level cap

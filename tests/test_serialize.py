@@ -2,9 +2,9 @@
 
 import pytest
 
-from otrs.group import Scalar, base_mul
-from otrs.otrs import PublicKey
-from otrs.serialize import decode_signature, encode_ring, encode_signature
+from trs.group import Scalar, base_mul
+from trs.trs import PublicKey
+from trs.serialize import decode_signature, encode_ring, encode_signature
 
 
 class TestEncodeRing:

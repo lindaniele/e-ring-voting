@@ -1,30 +1,33 @@
 """
-chain — PoW blockchain alternative to the federated bulletin board.
+chain — the e-ring-voting proof-of-work chain.
 
-A from-scratch implementation of an OTRS-voting system whose storage and
-ordering layer is a Bitcoin-style proof-of-work chain rather than the
-threshold-signed bulletin board of :mod:`voting`. The cryptographic
-primitive is the same (:mod:`otrs`); the typed voting records are reused
-from :mod:`voting.records`. What changes is *who orders the records*: a
-named t-of-N publisher cohort + witness federation in :mod:`voting`,
-versus open mining + heaviest-chain selection here.
-
-This is the second of the two architectures the artifact paper compares.
+The chain carries an eVote ledger and runs polls whose rules realise the
+original e-ring-voting design: traceable ring signatures (:mod:`trs`) for
+anonymous ballots, deposits burned when a registered key double-signs,
+beacon-assigned fixed-size groups, and key transfers between rounds. The
+typed records are shared with :mod:`voting`, whose federated bulletin board
+serves as the permissioned baseline the paper compares against.
 """
 
 from chain.block import Block, BlockHeader, make_genesis, verify_pow
 from chain.node import Node, make_genesis_node
-from chain.state import ChainParams, DEFAULT_PARAMS, State, StateError, apply_block
+from chain.state import (
+    ChainParams,
+    DEFAULT_PARAMS,
+    State,
+    StateError,
+    apply_block,
+    next_difficulty,
+    state_for_next_block,
+)
 from chain.transactions import (
     Transaction,
     TxKind,
     make_ballot,
-    make_close_poll,
     make_coinbase,
-    make_publish_ring,
+    make_key_transfer,
     make_register_voter,
     make_setup_poll,
-    make_tally,
     make_transfer,
 )
 
@@ -40,14 +43,14 @@ __all__ = [
     "TxKind",
     "apply_block",
     "make_ballot",
-    "make_close_poll",
     "make_coinbase",
     "make_genesis",
     "make_genesis_node",
-    "make_publish_ring",
+    "make_key_transfer",
     "make_register_voter",
     "make_setup_poll",
-    "make_tally",
     "make_transfer",
+    "next_difficulty",
+    "state_for_next_block",
     "verify_pow",
 ]

@@ -1,9 +1,9 @@
 """
-Microbenchmarks for OTRS: sign / verify / trace cost vs ring size.
+Microbenchmarks for TRS: sign / verify / trace cost vs ring size.
 
 Run with:
-    python -m bench.bench_otrs              # default sizes
-    python -m bench.bench_otrs --sizes 2,4,8,16,32
+    python -m bench.bench_trs              # default sizes
+    python -m bench.bench_trs --sizes 2,4,8,16,32
 
 The output is a CSV table on stdout and a printed summary; pipe to a file or
 into ``bench/results/`` if you want to keep it. We deliberately keep this in
@@ -24,7 +24,7 @@ from typing import Iterable
 # Local import path when run from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from otrs import keygen, sign, trace, verify  # noqa: E402
+from trs import keygen, sign, trace, verify  # noqa: E402
 
 
 def _bench(fn, *args, repeat: int = 5):

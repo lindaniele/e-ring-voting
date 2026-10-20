@@ -3,34 +3,55 @@ Chain state: account ledger + per-poll election state machine.
 
 The state is the result of folding a sequence of blocks. Applying a block
 either succeeds and mutates the state in place, or raises
-:class:`StateError` and leaves the state untouched (apply on a snapshot
-if you need rewind semantics — see :func:`State.copy`).
+:class:`StateError` and leaves the state untouched.
+
+This is where the e-ring-voting design lives (see ``paper/artifact.tex``):
+
+* **Deterrence, not just detection.** Registering a voter locks
+  ``setup.deposit`` eVotes from the sponsor. A registered key that signs
+  two different messages under the same tag is exposed by the FS07 trace
+  rule; at the end of the poll its deposit is *burned* (a forfeit: it goes
+  to nobody, so no miner profits from including the evidence) and every
+  other deposit is refunded.
+* **Groups nobody chooses.** Ring signatures are O(n), so voters sign
+  inside groups of at least ``setup.group_size`` members, assigned from a
+  beacon (the hash of the block preceding the freeze), see
+  :mod:`voting.groups`.
+* **Key transfer between groups.** In every round but the last, a voter
+  may instead sign a :class:`~voting.records.KeyTransfer` that moves their
+  voting right to a fresh key, regrouped in the next round.
+* **The chain's clock drives the poll.** Phases change at the first block
+  whose timestamp crosses ``voting_open``, a round boundary, or
+  ``voting_close``; nobody (including the poll creator) can stall the
+  freeze, the regrouping, the tally, or the refunds.
 
 Block-level rules
 -----------------
 * The first transaction MUST be a coinbase. No further coinbases.
-* PoW must verify, prev_hash must match the tip, height = tip.height + 1,
-  timestamp > parent.timestamp.
-* The coinbase amount must equal ``block_reward + sum(fees)`` of all
-  fee-bearing transactions in the block.
+* PoW must verify **at the difficulty the adjustment rule prescribes**,
+  prev_hash must match the tip, height = tip.height + 1, timestamp >
+  parent.timestamp.
+* The coinbase amount must equal ``block_reward + sum(fees)``. Deposits
+  are escrowed, never paid to the miner.
 
 Transaction-level rules
 -----------------------
 * Transfers: signed by sender, nonce matches account, sufficient balance.
-* Voting transactions wrap the ``voting.records`` types and enforce the
-  same state machine on a per-poll basis. Poll creator is the only
-  identity that may publish the ring / close / tally for their own poll.
-* Ballots are unsigned at the chain layer — anonymity preserved. The
-  OTRS signature inside the payload is what proves validity.
+* Poll setup and voter registration are signed by the creator / sponsor;
+  registration carries the voter's proof of possession.
+* Ballots and key transfers are unsigned at the chain layer — anonymity
+  preserved. The TRS signature inside the payload is what proves validity.
+  A message linked to one already recorded (a replay) is invalid, and so is
+  any further message from a signer already exposed, so a double-signer can
+  add at most one extra message to the chain.
 """
 
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
-from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: F401  (re-export shape)
+from dataclasses import dataclass, field, replace
+from statistics import median
+from typing import Dict, List, Optional, Set, Tuple
 
 from chain.block import Block, block_weight, is_genesis, verify_pow
 from chain.transactions import (
@@ -39,21 +60,17 @@ from chain.transactions import (
     TxKind,
     verify_tx_sig,
 )
-from otrs import PublicKey, Signature, verify as otrs_verify
-from otrs.group import Scalar
-from otrs.hash import hash_to_group
-from otrs.otrs import DST_H1
-from otrs.serialize import encode_ring
+from trs import PublicKey, Signature, verify as trs_verify, verify_possession
+from voting.groups import assign_groups, issue_for
 from voting.records import (
     Ballot,
     ElectionSetup,
+    KeyTransfer,
     RecordError,
-    RingPublication,
-    TallyPublication,
     VoterRegistration,
-    VotingClosed,
     parse_payload,
 )
+from voting.tally import EVIDENCE, FRESH, TagBook
 
 
 class StateError(Exception):
@@ -70,9 +87,6 @@ class ChainParams:
     block_reward: int = 50
     setup_fee: int = 5
     registration_fee: int = 1
-    ring_fee: int = 1
-    close_fee: int = 1
-    tally_fee: int = 1
     target_block_seconds: int = 60
     difficulty_adjust_window: int = 11
     difficulty_min: int = 1
@@ -82,8 +96,40 @@ class ChainParams:
 DEFAULT_PARAMS = ChainParams()
 
 
+def next_difficulty(
+    parent_difficulty: int,
+    recent_timestamps: List[int],
+    *,
+    params: ChainParams = DEFAULT_PARAMS,
+) -> int:
+    """
+    The difficulty the *next* block must carry (a consensus rule).
+
+    ``recent_timestamps`` are the timestamps of the most recent
+    ``difficulty_adjust_window`` blocks, oldest first. Until a full window
+    exists the difficulty stays at the parent's value. Otherwise (as in the
+    legacy node): a median inter-block interval below half the target raises
+    difficulty by one bit, above 3/2 of the target lowers it by one.
+    Bounded by [difficulty_min, difficulty_max].
+    """
+    if len(recent_timestamps) < params.difficulty_adjust_window:
+        return parent_difficulty
+    intervals = [b - a for a, b in zip(recent_timestamps, recent_timestamps[1:])]
+    if not intervals:
+        return parent_difficulty
+    m = median(intervals)
+    target = params.target_block_seconds
+    if m < target * 0.5:
+        new = parent_difficulty + 1
+    elif m > target * 1.5:
+        new = parent_difficulty - 1
+    else:
+        new = parent_difficulty
+    return max(params.difficulty_min, min(params.difficulty_max, new))
+
+
 # --------------------------------------------------------------------------- #
-# Account ledger                                                               #
+# Account ledger and poll state                                                #
 # --------------------------------------------------------------------------- #
 
 
@@ -94,17 +140,58 @@ class Account:
 
 
 @dataclass
+class RoundState:
+    """One voting round: its groups and the messages signed in each group."""
+
+    beacon: bytes
+    groups: List[List[PublicKey]]
+    books: List[TagBook]
+
+    def copy(self) -> "RoundState":
+        return RoundState(
+            beacon=self.beacon,
+            groups=self.groups,
+            books=[b.copy() for b in self.books],
+        )
+
+
+@dataclass(frozen=True)
+class PollResult:
+    """Computed by the chain itself at the first block past ``voting_close``."""
+
+    tally: Dict[str, int]
+    culprits: List[Tuple[int, str]]   # (round, pk_b64) of exposed double-signers
+    slashed: int                      # eVotes burned (round-0 culprits' deposits)
+    refunded: int                     # eVotes returned to sponsors
+    transfers: List[int]              # accepted key transfers, per round
+
+
+@dataclass
 class PollState:
     election_id: str
     creator_pk_b64: str
     setup: ElectionSetup
-    phase: str  # "registration" | "voting" | "closed" | "tallied"
+    phase: str  # "registration" | "voting" | "closed" | "aborted"
     registrations: List[VoterRegistration] = field(default_factory=list)
-    ring_pks: Optional[List[PublicKey]] = None
-    ring_bytes: Optional[bytes] = None
-    # (block_height, choice, sig, message_bytes) per accepted ballot:
-    ballots: List[Tuple[int, str, Signature, bytes]] = field(default_factory=list)
-    claimed_tally: Optional[TallyPublication] = None
+    # voter_pk_b64 -> (sponsor_pk_b64, locked amount)
+    escrow: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+    # every key that is or will be a member of some round (no key twice)
+    known_keys: Set[bytes] = field(default_factory=set)
+    rounds: List[RoundState] = field(default_factory=list)
+    result: Optional[PollResult] = None
+
+    @property
+    def current_round(self) -> int:
+        return len(self.rounds) - 1
+
+    def copy(self) -> "PollState":
+        return replace(
+            self,
+            registrations=list(self.registrations),
+            escrow=dict(self.escrow),
+            known_keys=set(self.known_keys),
+            rounds=[r.copy() for r in self.rounds],
+        )
 
 
 @dataclass
@@ -115,6 +202,9 @@ class State:
     tip_hash: bytes = b""
     last_timestamp: int = 0
     cum_weight: int = 0  # sum of 2^difficulty across all applied blocks
+    tip_difficulty: int = 0
+    recent_timestamps: List[int] = field(default_factory=list)
+    burned: int = 0  # eVotes destroyed by slashing, ever
 
     # ----- account helpers ----------------------------------------------- #
     def _account(self, pk_b64: str) -> Account:
@@ -153,28 +243,133 @@ class State:
 
     def copy(self) -> "State":
         """Deep-ish copy: accounts and polls are duplicated; raw bytes shared."""
-        new = State(
-            height=self.height,
-            tip_hash=self.tip_hash,
-            last_timestamp=self.last_timestamp,
-            cum_weight=self.cum_weight,
+        return replace(
+            self,
+            accounts={k: Account(balance=v.balance, nonce=v.nonce) for k, v in self.accounts.items()},
+            polls={k: v.copy() for k, v in self.polls.items()},
+            recent_timestamps=list(self.recent_timestamps),
         )
-        new.accounts = {k: Account(balance=v.balance, nonce=v.nonce) for k, v in self.accounts.items()}
-        new.polls = {
-            k: PollState(
-                election_id=v.election_id,
-                creator_pk_b64=v.creator_pk_b64,
-                setup=v.setup,
-                phase=v.phase,
-                registrations=list(v.registrations),
-                ring_pks=list(v.ring_pks) if v.ring_pks is not None else None,
-                ring_bytes=v.ring_bytes,
-                ballots=list(v.ballots),
-                claimed_tally=v.claimed_tally,
+
+
+# --------------------------------------------------------------------------- #
+# Poll lifecycle (driven by block timestamps)                                  #
+# --------------------------------------------------------------------------- #
+
+
+def round_at(setup: ElectionSetup, timestamp: int) -> int:
+    """The round a timestamp inside [voting_open, voting_close) belongs to."""
+    span = setup.voting_close - setup.voting_open
+    r = (timestamp - setup.voting_open) * setup.rounds // span
+    return max(0, min(setup.rounds - 1, r))
+
+
+def _open_round(poll: PollState, members: List[bytes], beacon: bytes) -> None:
+    r = len(poll.rounds)
+    issue = issue_for(poll.election_id, r)
+    groups_raw = assign_groups(members, poll.setup.group_size, beacon, issue)
+    groups = [[PublicKey.from_bytes(pk) for pk in g] for g in groups_raw]
+    poll.rounds.append(
+        RoundState(
+            beacon=beacon,
+            groups=groups,
+            books=[TagBook(issue=issue, ring=g) for g in groups],
+        )
+    )
+
+
+def _transferred_keys(rnd: RoundState) -> List[bytes]:
+    """New keys from this round's transfers whose signer did not double-sign."""
+    out: List[bytes] = []
+    for book in rnd.books:
+        for i in book.classify().accepted:
+            record = book.refs[i]
+            if isinstance(record, KeyTransfer):
+                out.append(b64decode(record.new_pk_b64))
+    return out
+
+
+def _settle(state: State, poll: PollState, slashed_keys: Set[str]) -> Tuple[int, int]:
+    slashed = refunded = 0
+    for voter_b64, (sponsor_b64, amount) in sorted(poll.escrow.items()):
+        if voter_b64 in slashed_keys:
+            slashed += amount
+        else:
+            state.credit(sponsor_b64, amount)
+            refunded += amount
+    state.burned += slashed
+    poll.escrow = {}
+    return slashed, refunded
+
+
+def _finalize(state: State, poll: PollState) -> None:
+    tally = {opt: 0 for opt in poll.setup.options}
+    culprits: List[Tuple[int, str]] = []
+    transfers: List[int] = []
+    for r, rnd in enumerate(poll.rounds):
+        moved = 0
+        for group, book in zip(rnd.groups, rnd.books):
+            verdict = book.classify()
+            for i in verdict.accepted:
+                record = book.refs[i]
+                if isinstance(record, Ballot):
+                    tally[record.choice] += 1
+                else:
+                    moved += 1
+            culprits.extend(
+                (r, b64encode(group[j].point.raw).decode()) for j in verdict.culprits
             )
-            for k, v in self.polls.items()
-        }
-        return new
+        transfers.append(moved)
+    # Only registered (round-0) keys have a deposit behind them. A key that
+    # arrived by transfer is anonymous: its double-sign voids its messages
+    # but there is no identity, hence no deposit, to slash.
+    slashed, refunded = _settle(state, poll, {pk for r, pk in culprits if r == 0})
+    poll.result = PollResult(
+        tally=tally,
+        culprits=culprits,
+        slashed=slashed,
+        refunded=refunded,
+        transfers=transfers,
+    )
+    poll.phase = "closed"
+
+
+def _advance_poll(state: State, poll: PollState, timestamp: int, beacon: bytes) -> None:
+    setup = poll.setup
+    if poll.phase == "registration" and timestamp >= setup.voting_open:
+        members = [b64decode(r.voter_pk_b64) for r in poll.registrations]
+        if len(members) < 2:
+            _settle(state, poll, set())
+            poll.phase = "aborted"
+            return
+        _open_round(poll, members, beacon)
+        poll.phase = "voting"
+    if poll.phase != "voting":
+        return
+    last = setup.rounds - 1 if timestamp >= setup.voting_close else round_at(setup, timestamp)
+    while poll.current_round < last:
+        _open_round(poll, _transferred_keys(poll.rounds[-1]), beacon)
+    if timestamp >= setup.voting_close:
+        _finalize(state, poll)
+
+
+def advance_polls(state: State, timestamp: int, beacon: bytes) -> None:
+    """
+    Apply every phase change due at the start of a block.
+
+    ``beacon`` is the block's ``prev_hash``: fixed before the block is mined,
+    unknown when registrations (or the previous round's transfers) were
+    made. Exposed so clients can compute the groups a ballot in the next
+    block must use (see :func:`state_for_next_block`).
+    """
+    for eid in sorted(state.polls):
+        _advance_poll(state, state.polls[eid], timestamp, beacon)
+
+
+def state_for_next_block(state: State, timestamp: int) -> State:
+    """A copy of ``state`` as seen by txs of a block at ``timestamp`` on the tip."""
+    preview = state.copy()
+    advance_polls(preview, timestamp, state.tip_hash)
+    return preview
 
 
 # --------------------------------------------------------------------------- #
@@ -241,7 +436,9 @@ def _consume_fee_and_nonce(
     return signer_b64, signer_raw
 
 
-def _apply_setup_poll(state: State, tx: Transaction, *, params: ChainParams) -> int:
+def _apply_setup_poll(
+    state: State, tx: Transaction, *, params: ChainParams, block_timestamp: int
+) -> int:
     body = tx.body
     try:
         fee = int(body["fee"])
@@ -251,7 +448,7 @@ def _apply_setup_poll(state: State, tx: Transaction, *, params: ChainParams) -> 
         raise StateError(f"malformed setup_poll: {exc}") from exc
     if fee < params.setup_fee:
         raise StateError(f"setup fee {fee} below minimum {params.setup_fee}")
-    creator_b64, creator_raw = _consume_fee_and_nonce(state, tx, "creator_pk_b64", fee, nonce)
+    creator_b64, _ = _consume_fee_and_nonce(state, tx, "creator_pk_b64", fee, nonce)
     try:
         record = parse_payload(setup_payload)
     except RecordError as exc:
@@ -264,6 +461,9 @@ def _apply_setup_poll(state: State, tx: Transaction, *, params: ChainParams) -> 
         raise StateError(f"ElectionSetup invalid: {exc}") from exc
     if record.election_id in state.polls:
         raise StateError(f"election_id {record.election_id!r} already exists")
+    if record.voting_open <= block_timestamp:
+        # Otherwise the freeze (and its beacon) would already be in the past.
+        raise StateError("voting_open must lie after the setup block")
     state.polls[record.election_id] = PollState(
         election_id=record.election_id,
         creator_pk_b64=creator_b64,
@@ -273,13 +473,6 @@ def _apply_setup_poll(state: State, tx: Transaction, *, params: ChainParams) -> 
     return fee
 
 
-def _expect_poll_creator(poll: PollState, signer_b64: str) -> None:
-    if signer_b64 != poll.creator_pk_b64:
-        raise StateError(
-            f"only poll creator may issue this tx (poll {poll.election_id[:12]}…)"
-        )
-
-
 def _apply_register_voter(
     state: State, tx: Transaction, *, params: ChainParams, block_timestamp: int
 ) -> int:
@@ -287,16 +480,20 @@ def _apply_register_voter(
     try:
         fee = int(body["fee"])
         nonce = int(body["nonce"])
+        deposit = int(body["deposit"])
         election_id = str(body["election_id"])
         reg_payload = b64decode(str(body["registration_payload_b64"]))
     except (KeyError, ValueError, TypeError) as exc:
         raise StateError(f"malformed register_voter: {exc}") from exc
     if fee < params.registration_fee:
         raise StateError(f"registration fee {fee} below minimum {params.registration_fee}")
-    sponsor_b64, _ = _consume_fee_and_nonce(state, tx, "sponsor_pk_b64", fee, nonce)
     poll = state.polls.get(election_id)
     if poll is None:
         raise StateError(f"unknown election_id {election_id!r}")
+    if deposit != poll.setup.deposit:
+        raise StateError(f"deposit {deposit} != poll deposit {poll.setup.deposit}")
+    sponsor_b64, _ = _consume_fee_and_nonce(state, tx, "sponsor_pk_b64", fee, nonce)
+    state.debit(sponsor_b64, deposit)
     if poll.phase != "registration":
         raise StateError(f"poll {election_id[:12]}… not in registration phase")
     if block_timestamp > poll.setup.registration_close:
@@ -311,155 +508,77 @@ def _apply_register_voter(
     if len(pk_raw) != 32:
         raise StateError("voter_pk_b64 must decode to 32 bytes")
     try:
-        PublicKey.from_bytes(pk_raw)
+        voter_pk = PublicKey.from_bytes(pk_raw)
     except ValueError as exc:
         raise StateError(f"voter_pk is not a valid Ristretto255 point: {exc}") from exc
-    if any(r.voter_pk_b64 == record.voter_pk_b64 for r in poll.registrations):
+    if pk_raw in poll.known_keys:
         raise StateError("voter already registered")
+    context = VoterRegistration.pop_context(election_id, record.voter_handle)
+    if not verify_possession(voter_pk, context, b64decode(record.pop_sig_b64)):
+        raise StateError("registration lacks a valid proof of possession")
     poll.registrations.append(record)
-    _ = sponsor_b64  # sponsor identity does not bind to the registration in this prototype
+    poll.known_keys.add(pk_raw)
+    poll.escrow[record.voter_pk_b64] = (sponsor_b64, deposit)
     return fee
 
 
-def _apply_publish_ring(
-    state: State, tx: Transaction, *, params: ChainParams
-) -> int:
-    body = tx.body
-    try:
-        fee = int(body["fee"])
-        nonce = int(body["nonce"])
-        election_id = str(body["election_id"])
-        ring_payload = b64decode(str(body["ring_payload_b64"]))
-    except (KeyError, ValueError, TypeError) as exc:
-        raise StateError(f"malformed publish_ring: {exc}") from exc
-    if fee < params.ring_fee:
-        raise StateError(f"ring fee {fee} below minimum {params.ring_fee}")
-    creator_b64, _ = _consume_fee_and_nonce(state, tx, "creator_pk_b64", fee, nonce)
-    poll = state.polls.get(election_id)
-    if poll is None:
-        raise StateError(f"unknown election_id {election_id!r}")
-    _expect_poll_creator(poll, creator_b64)
-    if poll.phase != "registration":
-        raise StateError(f"poll {election_id[:12]}… not in registration phase")
-    try:
-        record = parse_payload(ring_payload)
-    except RecordError as exc:
-        raise StateError(f"ring_payload invalid: {exc}") from exc
-    if not isinstance(record, RingPublication):
-        raise StateError("ring_payload must contain RingPublication")
-    attested = {r.voter_pk_b64 for r in poll.registrations}
-    declared = set(record.ring_b64)
-    if attested != declared:
-        raise StateError("published ring does not match attested registrations")
-    if len(record.ring_b64) != len(declared):
-        raise StateError("published ring contains duplicates")
-    ring_raw = [b64decode(s) for s in record.ring_b64]
-    ring_pks = [PublicKey.from_bytes(r) for r in ring_raw]
-    poll.ring_pks = ring_pks
-    poll.ring_bytes = encode_ring([pk.point for pk in ring_pks])
-    poll.phase = "voting"
-    return fee
-
-
-def _apply_ballot(
-    state: State, tx: Transaction, *, block_height: int, block_timestamp: int
-) -> int:
+def _apply_anonymous(state: State, tx: Transaction) -> None:
+    """A ballot or a key transfer: no sender, no fee; the TRS signature rules."""
     body = tx.body
     try:
         election_id = str(body["election_id"])
-        ballot_payload = b64decode(str(body["ballot_payload_b64"]))
+        payload = b64decode(str(body["payload_b64"]))
     except (KeyError, ValueError, TypeError) as exc:
-        raise StateError(f"malformed ballot: {exc}") from exc
+        raise StateError(f"malformed {tx.kind}: {exc}") from exc
     poll = state.polls.get(election_id)
     if poll is None:
         raise StateError(f"unknown election_id {election_id!r}")
     if poll.phase != "voting":
         raise StateError(f"poll {election_id[:12]}… not in voting phase")
-    if block_timestamp < poll.setup.voting_open:
-        raise StateError("ballot block timestamp before voting_open")
-    if block_timestamp > poll.setup.voting_close:
-        raise StateError("ballot block timestamp after voting_close")
     try:
-        record = parse_payload(ballot_payload)
+        record = parse_payload(payload)
     except RecordError as exc:
-        raise StateError(f"ballot_payload invalid: {exc}") from exc
-    if not isinstance(record, Ballot):
-        raise StateError("ballot_payload must contain Ballot")
-    if record.choice not in poll.setup.options:
-        raise StateError(f"choice {record.choice!r} not in options")
+        raise StateError(f"{tx.kind} payload invalid: {exc}") from exc
+    expected = Ballot if tx.kind == TxKind.BALLOT.value else KeyTransfer
+    if not isinstance(record, expected):
+        raise StateError(f"{tx.kind} payload must contain {expected.__name__}")
+    if record.round != poll.current_round:
+        raise StateError(
+            f"{tx.kind} for round {record.round}, current round is {poll.current_round}"
+        )
+    rnd = poll.rounds[record.round]
+    if not 0 <= record.group < len(rnd.groups):
+        raise StateError(f"no group {record.group} in round {record.round}")
+
+    new_pk_raw = b""
+    if isinstance(record, Ballot):
+        if record.choice not in poll.setup.options:
+            raise StateError(f"choice {record.choice!r} not in options")
+        message = Ballot.message_for(record.choice)
+    else:
+        if record.round >= poll.setup.rounds - 1:
+            raise StateError("no key transfers in the last round")
+        new_pk_raw = b64decode(record.new_pk_b64)
+        try:
+            PublicKey.from_bytes(new_pk_raw)
+        except ValueError as exc:
+            raise StateError(f"new_pk is not a valid Ristretto255 point: {exc}") from exc
+        if new_pk_raw in poll.known_keys:
+            raise StateError("key transfer target is already a member of this poll")
+        message = KeyTransfer.message_for(new_pk_raw)
+
     try:
-        sig = Signature.from_bytes(b64decode(record.otrs_sig_b64))
+        sig = Signature.from_bytes(b64decode(record.trs_sig_b64))
     except (ValueError, Exception) as exc:  # noqa: BLE001
-        raise StateError(f"malformed OTRS signature: {exc}") from exc
-    msg = Ballot.message_for(record.choice)
-    assert poll.ring_pks is not None
-    if not otrs_verify(sig, bytes.fromhex(poll.setup.election_id), msg, poll.ring_pks):
-        raise StateError("OTRS signature does not verify against the ring")
-    poll.ballots.append((block_height, record.choice, sig, msg))
-    return 0  # no fee for ballots
-
-
-def _apply_close_poll(
-    state: State, tx: Transaction, *, params: ChainParams, block_timestamp: int
-) -> int:
-    body = tx.body
-    try:
-        fee = int(body["fee"])
-        nonce = int(body["nonce"])
-        election_id = str(body["election_id"])
-        closed_payload = b64decode(str(body["closed_payload_b64"]))
-    except (KeyError, ValueError, TypeError) as exc:
-        raise StateError(f"malformed close_poll: {exc}") from exc
-    if fee < params.close_fee:
-        raise StateError(f"close fee {fee} below minimum {params.close_fee}")
-    creator_b64, _ = _consume_fee_and_nonce(state, tx, "creator_pk_b64", fee, nonce)
-    poll = state.polls.get(election_id)
-    if poll is None:
-        raise StateError(f"unknown election_id {election_id!r}")
-    _expect_poll_creator(poll, creator_b64)
-    if poll.phase != "voting":
-        raise StateError(f"poll {election_id[:12]}… not in voting phase")
-    try:
-        record = parse_payload(closed_payload)
-    except RecordError as exc:
-        raise StateError(f"closed_payload invalid: {exc}") from exc
-    if not isinstance(record, VotingClosed):
-        raise StateError("closed_payload must contain VotingClosed")
-    if block_timestamp < poll.setup.voting_close:
-        raise StateError("cannot close before voting_close")
-    poll.phase = "closed"
-    return fee
-
-
-def _apply_tally(
-    state: State, tx: Transaction, *, params: ChainParams
-) -> int:
-    body = tx.body
-    try:
-        fee = int(body["fee"])
-        nonce = int(body["nonce"])
-        election_id = str(body["election_id"])
-        tally_payload = b64decode(str(body["tally_payload_b64"]))
-    except (KeyError, ValueError, TypeError) as exc:
-        raise StateError(f"malformed tally: {exc}") from exc
-    if fee < params.tally_fee:
-        raise StateError(f"tally fee {fee} below minimum {params.tally_fee}")
-    creator_b64, _ = _consume_fee_and_nonce(state, tx, "creator_pk_b64", fee, nonce)
-    poll = state.polls.get(election_id)
-    if poll is None:
-        raise StateError(f"unknown election_id {election_id!r}")
-    _expect_poll_creator(poll, creator_b64)
-    if poll.phase != "closed":
-        raise StateError(f"poll {election_id[:12]}… not in closed phase")
-    try:
-        record = parse_payload(tally_payload)
-    except RecordError as exc:
-        raise StateError(f"tally_payload invalid: {exc}") from exc
-    if not isinstance(record, TallyPublication):
-        raise StateError("tally_payload must contain TallyPublication")
-    poll.claimed_tally = record
-    poll.phase = "tallied"
-    return fee
+        raise StateError(f"malformed TRS signature: {exc}") from exc
+    issue = issue_for(election_id, record.round)
+    if not trs_verify(sig, issue, message, rnd.groups[record.group]):
+        raise StateError("TRS signature does not verify against the group")
+    outcome = rnd.books[record.group].admit(message, sig, ref=record)
+    if outcome not in (FRESH, EVIDENCE):
+        raise StateError(f"{tx.kind} rejected: {outcome}")
+    if new_pk_raw:
+        poll.known_keys.add(new_pk_raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -467,17 +586,27 @@ def _apply_tally(
 # --------------------------------------------------------------------------- #
 
 
+def _record_block(state: State, block: Block, params: ChainParams) -> None:
+    state.height = block.height
+    state.tip_hash = block.hash
+    state.last_timestamp = block.timestamp
+    state.cum_weight += block_weight(block.difficulty)
+    state.tip_difficulty = block.difficulty
+    state.recent_timestamps = (state.recent_timestamps + [block.timestamp])[
+        -params.difficulty_adjust_window:
+    ]
+
+
 def _apply_genesis_inner(state: State, block: Block, *, params: ChainParams) -> None:
     if not is_genesis(block):
         raise StateError("first block must be genesis (prev_hash all-zero, height 0)")
+    if not params.difficulty_min <= block.difficulty <= params.difficulty_max:
+        raise StateError("genesis difficulty outside the protocol bounds")
     for tx in block.transactions:
         if tx.kind != TxKind.COINBASE.value:
             raise StateError("genesis may only contain coinbase transactions")
         _apply_coinbase(state, tx, block_height=0)
-    state.height = 0
-    state.tip_hash = block.hash
-    state.last_timestamp = block.timestamp
-    state.cum_weight = block_weight(block.difficulty)
+    _record_block(state, block, params)
 
 
 def _apply_block_inner(state: State, block: Block, *, params: ChainParams) -> None:
@@ -491,6 +620,9 @@ def _apply_block_inner(state: State, block: Block, *, params: ChainParams) -> No
         raise StateError(
             f"block timestamp {block.timestamp} not strictly after parent {state.last_timestamp}"
         )
+    required = next_difficulty(state.tip_difficulty, state.recent_timestamps, params=params)
+    if block.difficulty != required:
+        raise StateError(f"block difficulty {block.difficulty} != required {required}")
     if not verify_pow(block.header):
         raise StateError("PoW puzzle does not verify")
 
@@ -501,6 +633,8 @@ def _apply_block_inner(state: State, block: Block, *, params: ChainParams) -> No
         if tx.kind == TxKind.COINBASE.value:
             raise StateError("only one coinbase per block")
 
+    advance_polls(state, block.timestamp, block.prev_hash)
+
     fees_collected = 0
     for tx in txs[1:]:
         if tx.kind in SIGNED_KINDS and "signature_b64" not in tx.body:
@@ -508,23 +642,15 @@ def _apply_block_inner(state: State, block: Block, *, params: ChainParams) -> No
         if tx.kind == TxKind.TRANSFER.value:
             fees_collected += _apply_transfer(state, tx)
         elif tx.kind == TxKind.SETUP_POLL.value:
-            fees_collected += _apply_setup_poll(state, tx, params=params)
+            fees_collected += _apply_setup_poll(
+                state, tx, params=params, block_timestamp=block.timestamp
+            )
         elif tx.kind == TxKind.REGISTER_VOTER.value:
             fees_collected += _apply_register_voter(
                 state, tx, params=params, block_timestamp=block.timestamp
             )
-        elif tx.kind == TxKind.PUBLISH_RING.value:
-            fees_collected += _apply_publish_ring(state, tx, params=params)
-        elif tx.kind == TxKind.BALLOT.value:
-            _apply_ballot(
-                state, tx, block_height=block.height, block_timestamp=block.timestamp
-            )
-        elif tx.kind == TxKind.CLOSE_POLL.value:
-            fees_collected += _apply_close_poll(
-                state, tx, params=params, block_timestamp=block.timestamp
-            )
-        elif tx.kind == TxKind.TALLY.value:
-            fees_collected += _apply_tally(state, tx, params=params)
+        elif tx.kind in (TxKind.BALLOT.value, TxKind.KEY_TRANSFER.value):
+            _apply_anonymous(state, tx)
         else:
             raise StateError(f"unknown tx kind {tx.kind!r}")
 
@@ -534,11 +660,7 @@ def _apply_block_inner(state: State, block: Block, *, params: ChainParams) -> No
         raise StateError(
             f"coinbase amount {minted} != block_reward {params.block_reward} + fees {fees_collected}"
         )
-
-    state.height = block.height
-    state.tip_hash = block.hash
-    state.last_timestamp = block.timestamp
-    state.cum_weight += block_weight(block.difficulty)
+    _record_block(state, block, params)
 
 
 def apply_block(state: State, block: Block, *, params: ChainParams = DEFAULT_PARAMS) -> None:
@@ -552,13 +674,7 @@ def apply_block(state: State, block: Block, *, params: ChainParams = DEFAULT_PAR
         _apply_genesis_inner(working, block, params=params)
     else:
         _apply_block_inner(working, block, params=params)
-    # Commit on success.
-    state.accounts = working.accounts
-    state.polls = working.polls
-    state.height = working.height
-    state.tip_hash = working.tip_hash
-    state.last_timestamp = working.last_timestamp
-    state.cum_weight = working.cum_weight
+    state.__dict__.update(working.__dict__)
 
 
 def apply_chain(blocks: List[Block], *, params: ChainParams = DEFAULT_PARAMS) -> State:

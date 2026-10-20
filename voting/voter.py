@@ -3,7 +3,7 @@ Voter API.
 
 Voters do three things in this artifact:
 
-1. Generate an OTRS key pair locally.
+1. Generate an TRS key pair locally.
 2. Hand their public key + handle to the manager (out-of-band channel).
 3. Once the ring is published, sign a ballot and submit it (in our
    single-publisher model, "submit" means the manager appends it to the
@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from otrs import KeyPair, PublicKey, SecretKey, keygen, sign
-from otrs.group import Scalar, base_mul
+from trs import KeyPair, PublicKey, SecretKey, keygen, sign
+from trs.group import Scalar, base_mul
 from voting.log import BulletinBoard
 from voting.records import (
     Ballot,
@@ -37,7 +37,7 @@ from voting.records import (
 
 
 def new_keypair() -> KeyPair:
-    """Generate a fresh OTRS key pair."""
+    """Generate a fresh TRS key pair."""
     return keygen()
 
 
@@ -50,7 +50,7 @@ def import_keypair(sk_b64: str, pk_b64: str) -> KeyPair:
     sk_raw = b64decode(sk_b64)
     pk_raw = b64decode(pk_b64)
     if len(sk_raw) != 32 or len(pk_raw) != 32:
-        raise ValueError("OTRS keys must be 32 bytes")
+        raise ValueError("TRS keys must be 32 bytes")
     sk = SecretKey(Scalar(sk_raw))
     pk = PublicKey.from_bytes(pk_raw)
     # Optional sanity: pk should equal g^sk. We do not enforce it here
@@ -68,7 +68,7 @@ def import_keypair(sk_b64: str, pk_b64: str) -> KeyPair:
 class VotingContext:
     """The on-log facts a voter needs to sign a ballot."""
 
-    election_id_bytes: bytes  # OTRS issue
+    election_id_bytes: bytes  # TRS issue
     options: List[str]
     ring: List[PublicKey]     # in the order published on the log
 
@@ -114,4 +114,4 @@ def cast_ballot(
         raise ValueError("voter is not a member of the published ring")
     msg = Ballot.message_for(choice)
     sig = sign(voter.sk, voter.pk, context.election_id_bytes, msg, context.ring)
-    return Ballot(choice=choice, otrs_sig_b64=b64encode(sig.to_bytes()).decode())
+    return Ballot(choice=choice, trs_sig_b64=b64encode(sig.to_bytes()).decode())

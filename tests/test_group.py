@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from otrs.group import ORDER, POINT_BYTES, SCALAR_BYTES, Point, Scalar, base_mul
+from trs.group import ORDER, POINT_BYTES, SCALAR_BYTES, Point, Scalar, base_mul
 
 
 class TestScalar:

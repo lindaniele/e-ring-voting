@@ -23,7 +23,7 @@ import os
 from dataclasses import dataclass
 from typing import Final
 
-from otrs._libsodium import (
+from trs._libsodium import (
     POINT_BYTES as _POINT_BYTES,
     SCALAR_BYTES as _SCALAR_BYTES,
     crypto_core_ristretto255_add,

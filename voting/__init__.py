@@ -1,9 +1,16 @@
 """
-voting — verifiable anonymous voting system built on the OTRS primitive.
+voting — the election logic shared by both architectures.
 
-The package layers a single-publisher append-only bulletin board, a typed
-record schema for the election lifecycle, and three principal APIs (manager,
-voter, auditor) on top of the ring-signature library in ``otrs/``.
+* ``records``: the typed record schema (setup, registration, ballot, key
+  transfer, and the board-only ring / close / tally records);
+* ``groups``: beacon-driven assignment of voters to fixed-size groups;
+* ``tally``: classification of the messages signed in one group
+  (accepted, replayed, double-signed) with TRS tracing.
+
+On top of these, ``log`` / ``manager`` / ``voter`` / ``auditor`` /
+``witness`` implement Architecture A, the permissioned baseline: a single
+publisher with a witness cohort, one ring, no deposits. The design this
+project is about, Architecture B, lives in ``chain/``.
 
 See ``paper/threat_model.md`` for what is and is not defended against.
 """
@@ -12,6 +19,7 @@ from voting.log import BulletinBoard, Entry, LogError
 from voting.records import (
     Ballot,
     ElectionSetup,
+    KeyTransfer,
     RecordKind,
     RingPublication,
     TallyPublication,
@@ -25,6 +33,7 @@ __all__ = [
     "LogError",
     "Ballot",
     "ElectionSetup",
+    "KeyTransfer",
     "RecordKind",
     "RingPublication",
     "TallyPublication",

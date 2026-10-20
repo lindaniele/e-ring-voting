@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import hashlib
 import time
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+from trs import Signature
 
 from voting.log import (
     BulletinBoard,
@@ -149,8 +151,14 @@ def register_voter(
     cohort: CohortSpec,
     voter_pk: bytes,
     voter_handle: str,
+    pop_sig: bytes = b"",
 ) -> VoterRegistration:
-    """Publish a :class:`VoterRegistration` entry, co-signed by the cohort."""
+    """
+    Publish a :class:`VoterRegistration` entry, co-signed by the cohort.
+
+    ``pop_sig`` is the voter's optional proof of possession over
+    :meth:`VoterRegistration.pop_context`; the auditor checks it if present.
+    """
     log = BulletinBoard(log_path)
     pub = cohort.as_publisher_cohort()
     _current_setup(log)
@@ -160,6 +168,7 @@ def register_voter(
     reg = VoterRegistration(
         voter_pk_b64=b64encode(voter_pk).decode(),
         voter_handle=voter_handle,
+        pop_sig_b64=b64encode(pop_sig).decode(),
     )
     log.append(reg.to_payload(), cohort.sks[: cohort.threshold], pub)
     return reg
@@ -202,10 +211,28 @@ def publish_ring(*, log_path: Path, cohort: CohortSpec) -> RingPublication:
 def publish_ballot(
     *, log_path: Path, cohort: CohortSpec, ballot: Ballot
 ) -> None:
+    """
+    Append ``ballot`` unless it is linked to one already on the board.
+
+    Same choice and same ``A1`` means same signer and same message (FS07
+    "linked"), e.g. a copy of a published ballot. The auditor would count it
+    once anyway; refusing it keeps the board free of copies. A double-sign
+    (different choice) is accepted: it is the evidence that exposes the key.
+    """
     log = BulletinBoard(log_path)
     pub = cohort.as_publisher_cohort()
     _ensure_voting_open_not_closed(log)
+    key = _ballot_link_key(ballot)
+    for entry in log.read_all():
+        rec = parse_payload(entry.payload)
+        if isinstance(rec, Ballot) and _ballot_link_key(rec) == key:
+            raise ValueError("ballot is linked to one already on the board (replay)")
     log.append(ballot.to_payload(), cohort.sks[: cohort.threshold], pub)
+
+
+def _ballot_link_key(ballot: Ballot) -> Tuple[str, bytes]:
+    sig = Signature.from_bytes(b64decode(ballot.trs_sig_b64))
+    return ballot.choice, sig.A1.raw
 
 
 def close_voting(*, log_path: Path, cohort: CohortSpec) -> None:

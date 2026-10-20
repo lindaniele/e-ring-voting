@@ -3,8 +3,9 @@ PoW miner + difficulty adjustment.
 
 The miner is single-process for simplicity (the legacy code used a
 multiprocessing pool; for tests and demos a single Python thread is
-more than enough at the difficulties we run). Difficulty is adjusted
-once per block based on the median interval over a sliding window.
+more than enough at the difficulties we run). The difficulty a block must
+carry is a consensus rule, :func:`chain.state.next_difficulty`, re-exported
+here for miners.
 
 Mining a real PoW chain in Python is slow; the tests pin difficulty
 low (around 8-10 bits) so each block solves in a fraction of a second.
@@ -13,7 +14,6 @@ low (around 8-10 bits) so each block solves in a fraction of a second.
 from __future__ import annotations
 
 import os
-from statistics import median
 from typing import List, Optional
 
 from chain.block import (
@@ -23,44 +23,8 @@ from chain.block import (
     leading_zero_bits,
     verify_pow,
 )
-from chain.state import ChainParams, DEFAULT_PARAMS
+from chain.state import next_difficulty
 from chain.transactions import Transaction, tx_list_root
-
-
-def next_difficulty(
-    parent_difficulty: int,
-    recent_timestamps: List[int],
-    *,
-    params: ChainParams = DEFAULT_PARAMS,
-) -> int:
-    """
-    Compute the difficulty for the *next* block.
-
-    ``recent_timestamps`` is the list of timestamps for the most recent
-    ``difficulty_adjust_window`` blocks, oldest first. If we don't yet
-    have a full window, difficulty stays at the parent's value.
-
-    Rule (mirrors legacy/mining/block.py): if the median inter-block
-    interval falls *below* 1/2 the target, raise difficulty by one;
-    if it exceeds 3/2 the target, lower it by one; otherwise unchanged.
-    Bounded by [difficulty_min, difficulty_max].
-    """
-    if len(recent_timestamps) < params.difficulty_adjust_window:
-        return parent_difficulty
-    intervals = [
-        b - a for a, b in zip(recent_timestamps, recent_timestamps[1:])
-    ]
-    if not intervals:
-        return parent_difficulty
-    m = median(intervals)
-    target = params.target_block_seconds
-    if m < target * 0.5:
-        new = parent_difficulty + 1
-    elif m > target * 1.5:
-        new = parent_difficulty - 1
-    else:
-        new = parent_difficulty
-    return max(params.difficulty_min, min(params.difficulty_max, new))
 
 
 def assemble_block(

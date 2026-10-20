@@ -8,9 +8,10 @@ Two things we want to measure:
    cost; ledger application is microseconds.
 
 2. **End-to-end election cost**: wall-clock of a complete election on
-   the chain (setup, N voter registrations, ring publication, N ballots,
-   close, audit). Comparable to the same table for Architecture A in
-   ``paper/artifact.tex``.
+   the chain (setup, N voter registrations with proof of possession, N
+   ballots, the closing block that tallies and settles deposits, cold
+   audit), with one ring for everybody (``--group-size 0``) or with
+   beacon-assigned groups.
 
 Difficulty is pinned low (a few leading zero bits) so the benchmark
 finishes in seconds rather than minutes. The PoW cost scales as
@@ -20,6 +21,7 @@ extrapolate.
 Run with::
 
     python3 -m bench.bench_chain --voters 5,10,25,50 --difficulty 8
+    python3 -m bench.bench_chain --voters 50,100,200 --group-size 8
     python3 -m bench.bench_chain --pow-only --difficulty 4,8,12,16
 """
 
@@ -27,10 +29,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import statistics
 import sys
+import tempfile
 import time
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from pathlib import Path
 from typing import List, Tuple
 
@@ -41,26 +45,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
 from chain.auditor import audit_chain
-from chain.mining import mine_block, next_difficulty
+from chain.client import ballot_tx, registration_tx
+from chain.mining import mine_block
 from chain.node import Node, make_genesis_node
-from chain.state import ChainParams
-from chain.transactions import (
-    Transaction,
-    make_ballot,
-    make_close_poll,
-    make_coinbase,
-    make_publish_ring,
-    make_register_voter,
-    make_setup_poll,
-)
-from otrs import keygen, sign as otrs_sign
-from voting.records import (
-    Ballot,
-    ElectionSetup,
-    RingPublication,
-    VoterRegistration,
-    VotingClosed,
-)
+from chain.state import ChainParams, state_for_next_block
+from chain.transactions import Transaction, make_coinbase, make_setup_poll
+from trs import keygen
+from voting.records import ElectionSetup
 
 
 # --------------------------------------------------------------------------- #
@@ -83,9 +74,6 @@ def _params(difficulty: int) -> ChainParams:
         block_reward=50,
         setup_fee=5,
         registration_fee=1,
-        ring_fee=1,
-        close_fee=1,
-        tally_fee=1,
         target_block_seconds=60,
         difficulty_min=difficulty,
         difficulty_max=difficulty,  # pin difficulty for predictable cost
@@ -165,7 +153,7 @@ def bench_pow(difficulties: List[int], repeats: int = 5) -> List[dict]:
 
 def _build_setup(
     creator_pk: bytes, *, registration_close: int,
-    voting_open: int, voting_close: int,
+    voting_open: int, voting_close: int, group_size: int, deposit: int,
     options=("yes", "no"), title="Bench",
 ) -> ElectionSetup:
     import hashlib
@@ -182,10 +170,14 @@ def _build_setup(
         voting_close=voting_close,
         cohort_pks_b64=[b64encode(creator_pk).decode()],
         threshold=1,
+        group_size=group_size,
+        deposit=deposit,
     )
 
 
-def bench_election(voter_counts: List[int], difficulty: int = 8) -> List[dict]:
+def bench_election(
+    voter_counts: List[int], difficulty: int = 8, group_size: int = 0
+) -> List[dict]:
     """Run a complete election on the chain at each voter count and
     report per-phase wall-clock plus full audit cost."""
     rows = []
@@ -198,18 +190,14 @@ def bench_election(voter_counts: List[int], difficulty: int = 8) -> List[dict]:
         # timestamp and the lifecycle phases fall in the right windows.
         T_genesis = 1_700_000_000
         T_setup = T_genesis + 100
-        # registrations: N blocks at T_setup+1..T_setup+N
-        # ring:          T_setup+N+1
         registration_close = T_setup + n + 5
         voting_open = registration_close + 1
         voting_close = voting_open + n + 10  # leave room for N ballots
-        T_close = voting_close + 1
 
-        # Genesis with ample creator funding.
         node = make_genesis_node(
             timestamp=T_genesis,
             miner_pk_raw=miner_pk,
-            initial_allocations=[(creator_pk, 10000)],
+            initial_allocations=[(creator_pk, 100 * n + 100)],
             difficulty=difficulty,
             params=params,
         )
@@ -220,6 +208,8 @@ def bench_election(voter_counts: List[int], difficulty: int = 8) -> List[dict]:
             registration_close=registration_close,
             voting_open=voting_open,
             voting_close=voting_close,
+            group_size=group_size,
+            deposit=10,
         )
         ts = T_setup
         t0 = time.perf_counter()
@@ -232,101 +222,69 @@ def bench_election(voter_counts: List[int], difficulty: int = 8) -> List[dict]:
         _mine_tx(node, miner_pk, tx, fee=params.setup_fee, timestamp=ts)
         setup_ms = (time.perf_counter() - t0) * 1000.0
 
-        # ---------- register N voters ----------
+        # ---------- register N voters (with proof of possession) ----------
         voters = [keygen() for _ in range(n)]
         t0 = time.perf_counter()
         for i, kp in enumerate(voters):
-            reg = VoterRegistration(
-                voter_pk_b64=b64encode(kp.pk.point.raw).decode(),
-                voter_handle=f"v{i}",
-            )
             ts += 1
-            tx = make_register_voter(
-                creator_pk, setup.election_id, reg.to_payload(),
-                fee=params.registration_fee,
+            tx = registration_tx(
+                sponsor_pk_raw=creator_pk, sponsor_sk=creator_sk,
+                election_id=setup.election_id, voter=kp, handle=f"v{i}",
+                fee=params.registration_fee, deposit=setup.deposit,
                 nonce=node.state.nonce(creator_b64),
-                sk=creator_sk,
             )
             _mine_tx(node, miner_pk, tx, fee=params.registration_fee, timestamp=ts)
         register_total_ms = (time.perf_counter() - t0) * 1000.0
 
-        # ---------- publish ring ----------
-        ts += 1
-        t0 = time.perf_counter()
-        ring = RingPublication(
-            ring_b64=sorted({b64encode(kp.pk.point.raw).decode() for kp in voters})
-        )
-        tx = make_publish_ring(
-            creator_pk, setup.election_id, ring.to_payload(),
-            fee=params.ring_fee,
-            nonce=node.state.nonce(creator_b64),
-            sk=creator_sk,
-        )
-        _mine_tx(node, miner_pk, tx, fee=params.ring_fee, timestamp=ts)
-        ring_ms = (time.perf_counter() - t0) * 1000.0
-
-        poll = node.state.polls[setup.election_id]
-
         # ---------- ballots: all N voters cast ----------
-        # Jump timestamp into the voting window.
-        ts = max(ts + 1, voting_open + 1)
+        # The first ballot block crosses voting_open and freezes the groups.
+        ts = voting_open
+        sig_bytes = []
         t0 = time.perf_counter()
         for i, kp in enumerate(voters):
             choice = "yes" if i % 2 == 0 else "no"
-            msg = Ballot.message_for(choice)
-            sig = otrs_sign(
-                kp.sk, kp.pk,
-                bytes.fromhex(setup.election_id),
-                msg,
-                poll.ring_pks,
-            )
-            ballot = Ballot(
-                choice=choice,
-                otrs_sig_b64=b64encode(sig.to_bytes()).decode(),
-            )
-            tx = make_ballot(setup.election_id, ballot.to_payload())
+            poll = state_for_next_block(node.state, ts).polls[setup.election_id]
+            tx = ballot_tx(poll, kp, choice)
+            sig_bytes.append(len(b64decode(
+                json.loads(b64decode(tx.body["payload_b64"]))["trs_sig_b64"]
+            )))
             _mine_tx(node, miner_pk, tx, fee=0, timestamp=ts)
             ts += 1
         ballots_total_ms = (time.perf_counter() - t0) * 1000.0
 
-        # ---------- close ----------
+        # ---------- close: the chain tallies and settles deposits ----------
         t0 = time.perf_counter()
-        tx = make_close_poll(
-            creator_pk, setup.election_id, VotingClosed().to_payload(),
-            fee=params.close_fee,
-            nonce=node.state.nonce(creator_b64),
-            sk=creator_sk,
-        )
-        _mine_tx(node, miner_pk, tx, fee=params.close_fee, timestamp=T_close)
+        _mine_empty(node, miner_pk, timestamp=voting_close)
         close_ms = (time.perf_counter() - t0) * 1000.0
 
         # ---------- persist + audit (cold reload) ----------
-        chain_path = Path("/tmp") / f"bench_chain_{n}.bin"
-        node.save(chain_path)
-        chain_size_kb = chain_path.stat().st_size / 1024.0
-
-        t0 = time.perf_counter()
-        report = audit_chain(chain_path, params=params)
-        audit_ms = (time.perf_counter() - t0) * 1000.0
-        chain_path.unlink()
+        with tempfile.TemporaryDirectory() as tmp:
+            chain_path = Path(tmp) / f"bench_chain_{n}.bin"
+            node.save(chain_path)
+            chain_size_kb = chain_path.stat().st_size / 1024.0
+            t0 = time.perf_counter()
+            report = audit_chain(chain_path, params=params)
+            audit_ms = (time.perf_counter() - t0) * 1000.0
 
         # sanity
-        assert len(report.polls) == 1
-        rep = report.polls[0]
+        (rep,) = report.polls
         expected_yes = (n + 1) // 2
         expected_no = n // 2
         assert rep.tally == {"yes": expected_yes, "no": expected_no}, (
             f"unexpected tally at N={n}: {rep.tally}"
         )
+        assert rep.refunded == 10 * n
 
         rows.append({
             "voters": n,
+            "group_size": group_size,
+            "groups": len(rep.group_sizes[0]),
             "setup_ms": setup_ms,
             "register_total_ms": register_total_ms,
             "register_per_voter_ms": register_total_ms / n if n else 0.0,
-            "ring_ms": ring_ms,
             "ballots_total_ms": ballots_total_ms,
             "ballot_per_voter_ms": ballots_total_ms / n if n else 0.0,
+            "mean_sig_bytes": statistics.mean(sig_bytes),
             "close_ms": close_ms,
             "audit_ms": audit_ms,
             "chain_kb": chain_size_kb,
@@ -348,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
                          "or a single fixed difficulty for end-to-end mode"))
     p.add_argument("--voters", default="5,10,25,50",
                    help="Comma-separated voter counts for end-to-end bench")
+    p.add_argument("--group-size", type=int, default=0,
+                   help="Group size for the end-to-end bench (0 = one ring)")
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--output", type=Path, default=None,
                    help="Write CSV results here in addition to stdout")
@@ -360,11 +320,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         diff = int(args.difficulty.split(",")[0])
         voters = [int(s) for s in args.voters.split(",") if s.strip()]
-        rows = bench_election(voters, difficulty=diff)
+        rows = bench_election(voters, difficulty=diff, group_size=args.group_size)
         fieldnames = [
-            "voters", "setup_ms", "register_total_ms", "register_per_voter_ms",
-            "ring_ms", "ballots_total_ms", "ballot_per_voter_ms",
-            "close_ms", "audit_ms", "chain_kb",
+            "voters", "group_size", "groups", "setup_ms", "register_total_ms",
+            "register_per_voter_ms", "ballots_total_ms", "ballot_per_voter_ms",
+            "mean_sig_bytes", "close_ms", "audit_ms", "chain_kb",
         ]
 
     writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)

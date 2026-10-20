@@ -40,7 +40,7 @@
 \title{\textbf{E-Ring Voting --- Explain Like I'm Five}\\[0.4em]
        \large A walk-through with no math, for a curious high-schooler}
 \author{Daniele Lin \and Niccol\`o Pagano}
-\date{May 2026}
+\date{October 2026}
 
 \begin{document}
 \maketitle
@@ -88,8 +88,9 @@ means ``trust us, you can't see them.'' ``Anyone can recompute''
 usually means ``the votes are public.'' How can both be true?
 
 The whole project is built around one mathematical trick that breaks
-the contradiction. The rest of these notes explain the trick (in
-words), what we built around it, and where the limits are.
+the contradiction, plus one idea of ours on top: the same trick can
+make cheating \emph{cost money}. The rest of these notes explain the
+trick (in words), our idea, what we built, and where the limits are.
 
 % ===========================================================================
 \section{The contradiction, in concrete terms}
@@ -185,9 +186,9 @@ right kind of math, you can build a signature that depends on
 \emph{which} one. From the outside, all 50 possible signers look
 equally likely to have produced it.
 
-The exact construction we use was proposed in 2021 by two researchers,
-Alessandra Scafuro and Bihan Zhang. The repository implements their
-recipe step by step.
+The exact construction we use was proposed in 2007 by two researchers,
+Eiichiro Fujisaki and Koutarou Suzuki, under the name \emph{traceable
+ring signature}. The repository implements their recipe step by step.
 \end{aside}
 
 % ===========================================================================
@@ -200,9 +201,8 @@ Plain ring signatures don't stop her. She could sign ``pasta'' once,
 then sign ``pizza'' again, and there would be no way to tell that
 both signatures came from the same person.
 
-The fix is a feature called \textbf{one-time traceability}, which is
-what the ``T'' in our project name (e-\textbf{R}ing-voting + one-time
-\textbf{T}raceable) refers to. Here is the analogy:
+The fix is a feature called \textbf{traceability}. Here is the
+analogy:
 
 \begin{aside}[The wax-seal analogy]
 Imagine that when you sign a ballot, the signature automatically
@@ -399,36 +399,77 @@ have to defend against rented-hashpower attacks, which gets
 \emph{harder} the higher the political stakes.
 
 % ===========================================================================
+\section{Our idea: make cheating cost money}
+% ===========================================================================
+
+Most systems that use the magic envelope stop at ``if you vote twice,
+both of your votes are thrown away''. That is fair, but it costs the
+cheater nothing, so trying is free. The seal trick can do more: it
+tells everybody \emph{who} cheated. On Option~B, where there is a
+currency anyway, we use that.
+
+\begin{aside}[The deposit]
+When you register to vote, someone (you, or the organisation that
+vouches for you) locks a small amount of eVotes, like a deposit on a
+rented flat. If you vote once, you get it back after the election. If
+you sign twice, your seal shows up twice, the system names you, and the
+deposit is \emph{destroyed}. Nobody decides this; it is a rule that
+every computer checking the chain applies by itself.
+\end{aside}
+
+Destroyed, not given to anyone: if the person who builds the next block
+got the money, they would have a reason to create cheaters on purpose.
+
+\paragraph{Small groups instead of one huge crowd.} A magic envelope
+gets bigger with every person in the crowd: hiding among 1{,}000 people
+makes each ballot 64~kilobytes and slow to check. So voters are split
+into groups of, say, 8. But who decides the groups? If the organiser
+did, they could put you in a group with 7 people they control, and then
+your ballot is obviously yours. So nobody decides: the groups are
+shuffled using a random-looking number (the fingerprint of a block)
+that did not exist yet when registration closed.
+
+\paragraph{Changing group.} A small group is a small crowd. So in each
+round, instead of voting, you may hand your vote to a brand-new key of
+yours, which is put into a new group in the next round. Everybody sees
+that \emph{someone} in your old group moved, not who. When you then vote
+from the new group, you are hiding among all the old groups your new
+group-mates came from. Voting \emph{and} moving in the same round counts
+as signing twice.
+
+\paragraph{Where the idea came from.} We sketched all of this in
+2021--22 (group size, ``vote or move'', a forfeit separate from fees,
+voters signing their own registration). This version finishes it and
+makes the deposit per voter.
+
+% ===========================================================================
 \section{What this project actually built}
 % ===========================================================================
 
-We built both options. The repository is split into three folders:
-
 \begin{itemize}[leftmargin=*]
-  \item \texttt{otrs/} --- the cryptography (the magic envelope + the
-        seal trick). About 1{,}100 lines of Python. Used by both
-        options below.
-  \item \texttt{voting/} --- Option A, the named-team bulletin board.
-        About 1{,}800 lines.
-  \item \texttt{chain/} --- Option B, the proof-of-work chain. About
-        1{,}400 lines.
+  \item \texttt{trs/} --- the cryptography (the magic envelope + the
+        seal trick). About 1{,}000 lines of Python.
+  \item \texttt{chain/} --- Option B with our idea: deposits, groups,
+        changing group. About 2{,}200 lines.
+  \item \texttt{voting/} --- the shared election rules, plus Option A
+        (the named-team bulletin board) as the point of comparison.
 \end{itemize}
 
-Plus 127 automated tests that check the whole thing actually works
-the way we say it does.
+Plus 165 automated tests that check the whole thing works the way we
+say it does.
 
-We also ran benchmarks to compare. At 50 voters, the named-team
-option finishes a complete election in about 1.1 seconds and
-produces a 324~KB public record. The blockchain option finishes the
-same election in about 3.0 seconds and produces a 344~KB record ---
-so it is roughly $1.6\times$ slower and uses about $6\%$ more storage,
-mostly because the proof-of-work puzzle has to be solved for every
-block.
+Some numbers. With 1{,}000 voters in one crowd, checking all ballots
+takes over five minutes; in groups of 8 it takes under three seconds.
+If an attacker registers half of all voters as fake people, a voter in
+a group of 8 still hides among about 4.5 real people on average, and if
+half the voters change group once, that grows to about 30.
 
-\textbf{Both options produce the same answer to the question
-``who won.''} The cryptography that makes the votes anonymous and
-catchable-if-double-counted is exactly the same; what differs is who
-gets to write on the public record.
+\paragraph{Mistakes we found.} Our 2021 prototype had a bug that made
+the envelope see-through: anyone could work out who signed. Nothing in
+the demo showed it, because the ballots still checked out as valid. A
+later rewrite had a different bug: copying two honest ballots from the
+public record was enough to cancel both votes and blame an innocent
+voter. Both are fixed and tested.
 
 % ===========================================================================
 \section{What this project did \emph{not} fix}
@@ -463,12 +504,20 @@ real, hard, open problems --- not ones a small project can knock out.
         re-built on top of different mathematics
         (``post-quantum cryptography'').
 
-  \item \textbf{Ring size.} Right now, an election with 1000 voters
-        has 1000-person rings, and each ballot's signature is about
-        $64$~kilobytes. That's fine for small elections; it's not
-        fine for nation-scale ones. The fix is a class of
-        \emph{logarithmic-size} ring signatures (Triptych,
-        Groth--Kohlweiss-style), which we did not implement.
+  \item \textbf{Small groups leak.} Groups keep ballots small, but the
+        result is visible per group: if all 8 people in a group voted
+        pasta, everyone knows how each of them voted. Fake voters also
+        shrink the real crowd you hide in.
+
+  \item \textbf{The group shuffle is not perfectly fair.} Whoever
+        builds the block whose fingerprint shuffles the groups could
+        throw it away and try again. It costs them a block reward
+        every time, but it is possible.
+
+  \item \textbf{Keys you moved to cannot be fined.} A new key has no
+        deposit behind it (attaching one would reveal where it came
+        from), so if it signs twice its votes are thrown away but
+        nobody pays.
 
   \item \textbf{Truly proving the cryptography.} The math is correct
         in the paper that proposed it, but our specific Python
@@ -511,14 +560,19 @@ project sits in the same family but uses a different building block
 
 \begin{description}[leftmargin=1.2em, style=nextline, font=\bfseries]
   \item[Anonymity set] The crowd you are hiding inside. In our case,
-        the set of registered voters in this election.
+        your group (or, after changing group, all the groups your new
+        group-mates came from).
   \item[Ballot] A single voter's signed choice.
   \item[Bulletin board] The append-only public record where every
         election event is written. ``Append-only'' means new entries
         can be added but old entries cannot be edited or removed.
+  \item[Deposit] eVotes locked when you register, returned after the
+        election unless you signed twice.
   \item[Election ID] A unique label for one specific election. The
         seal mentioned in the wax-seal analogy depends on it, which
         is why a voter's seal looks different in different elections.
+  \item[Group] The small crowd you sign in, shuffled by a block
+        fingerprint nobody could predict at registration time.
   \item[Hash] A short fingerprint of a longer piece of data.
         ``SHA-256'' is the most common one. Changing even one bit of
         the input changes the fingerprint completely.
@@ -543,16 +597,16 @@ project sits in the same family but uses a different building block
 
 If you want the technical version of the same material, with the
 actual mathematics, read \texttt{notes.tex} in this same folder
-(25~pages). It walks through the same ideas with formulas, code
+(24~pages). It walks through the same ideas with formulas, code
 snippets, and a chapter on why the chain version is harder than it
 looks.
 
 If you want to skip the implementation details and read the
-research-style write-up, read \texttt{paper/artifact.tex} (16~pages).
+research-style write-up, read \texttt{paper/artifact.tex} (13~pages).
 It is structured like a small academic paper.
 
 If you want to read the code, the easiest starting point is
-\texttt{otrs/otrs.py} --- the central file --- followed by
-\texttt{tests/test\_otrs.py} which checks it works correctly.
+\texttt{trs/trs.py} (the magic envelope), then \texttt{chain/state.py}
+(deposits, groups, changing group), then \texttt{tests/test\_chain.py}.
 
 \end{document}

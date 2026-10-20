@@ -241,7 +241,7 @@ def cmd_vote(args):
         print(f"ballot submitted for choice={args.choice!r}")
     else:
         sys.stdout.write(json.dumps({
-            "choice": ballot.choice, "otrs_sig_b64": ballot.otrs_sig_b64,
+            "choice": ballot.choice, "trs_sig_b64": ballot.trs_sig_b64,
         }) + "\n")
 
 
@@ -418,7 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--voting-close", type=int, required=True)
     s.set_defaults(func=cmd_setup_cohort)
 
-    s = sub.add_parser("voter-keygen", help="Generate voter OTRS keypair")
+    s = sub.add_parser("voter-keygen", help="Generate voter TRS keypair")
     s.add_argument("--out", type=Path, required=True)
     s.set_defaults(func=cmd_voter_keygen)
 

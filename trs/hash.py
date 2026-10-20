@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 from typing import Final
 
-from otrs.group import Point, Scalar
+from trs.group import Point, Scalar
 
 SHA512_BLOCK: Final[int] = 128
 SHA512_OUT: Final[int] = 64

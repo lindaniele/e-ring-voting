@@ -1,5 +1,5 @@
 """
-One-time traceable ring signature (Scafuro & Zhang, 2021), instantiated over
+Traceable ring signature (Fujisaki & Suzuki, PKC 2007), instantiated over
 Ristretto255 with RFC 9380 hash-to-curve.
 
 The scheme provides:
@@ -8,11 +8,18 @@ The scheme provides:
   ``{pk_1, ..., pk_n}`` reveals nothing about which member produced it,
   assuming DDH is hard in the underlying group and the hash functions behave
   as random oracles.
-* **One-time traceability.** Two signatures by the same ring member on the
-  same ``issue`` are linkable: the ``trace`` algorithm identifies the
-  responsible public key without ever revealing the signer's identity from a
-  single signature. The intended use is e-voting, where ``issue`` is the
-  election identifier and one signature per voter is the rule.
+* **Traceability per tag.** The tag is ``(issue, ring)``. Two signatures by
+  the same ring member under the same tag on *different* messages expose
+  the member's public key (``trace`` returns ``"double-sign"``); on the
+  *same* message they are merely linked (``"linked"``), and the signer stays
+  anonymous. The intended use is e-voting, where ``issue`` names the
+  election and one message per voter is the rule.
+
+The ``h = H0(issue || ring)`` generator must have an unknown discrete log
+with respect to ``g``: if anyone knows ``k`` with ``h = g^k`` they can
+compute every member's trace tag ``h^{x_j} = pk_j^k`` and de-anonymise every
+signature. This is why ``H0`` is a real hash-to-curve and not
+``g^{H(.)}`` (the latter was the anonymity bug of ``legacy/``).
 
 Public domain-separation tags below pin the protocol version. Any change to
 the algebraic structure must change the tag prefix.
@@ -23,9 +30,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence
 
-from otrs.group import ORDER, Point, Scalar, base_mul
-from otrs.hash import hash_to_group, hash_to_scalar
-from otrs.serialize import (
+from trs.group import ORDER, Point, Scalar, base_mul
+from trs.hash import hash_to_group, hash_to_scalar
+from trs.serialize import (
     decode_signature,
     encode_points,
     encode_ring,
@@ -33,9 +40,9 @@ from otrs.serialize import (
 )
 
 # Version-bound domain-separation tags. Bump on any algebraic change.
-DST_H0 = b"OTRS-v1-RISTRETTO255-XMD:SHA-512-H0"
-DST_H1 = b"OTRS-v1-RISTRETTO255-XMD:SHA-512-H1"
-DST_H2 = b"OTRS-v1-RISTRETTO255-XMD:SHA-512-H2"
+DST_H0 = b"FS07-TRS-v1-RISTRETTO255-XMD:SHA-512-H0"
+DST_H1 = b"FS07-TRS-v1-RISTRETTO255-XMD:SHA-512-H1"
+DST_H2 = b"FS07-TRS-v1-RISTRETTO255-XMD:SHA-512-H2"
 
 
 # --------------------------------------------------------------------------- #
@@ -95,8 +102,9 @@ class TraceResult:
     * ``status == "double-sign"``: the same signer produced both signatures
       on distinct messages. ``culprit_index`` and ``culprit_pk`` identify them.
     * ``status == "linked"``: both signatures share every column, i.e. the
-      same signer produced both on the same message (a literal replay).
-    * ``status == "independent"``: no column collides; the signers differ.
+      same signer produced both on the same message (a literal replay or a
+      re-signature of the same message).
+    * ``status == "independent"``: the signers differ.
     """
 
     status: str  # "double-sign" | "linked" | "independent"
@@ -268,7 +276,7 @@ def verify(
     message: bytes,
     ring: Sequence[PublicKey],
 ) -> bool:
-    """Return ``True`` iff ``sig`` is a valid OTRS signature."""
+    """Return ``True`` iff ``sig`` is a valid TRS signature."""
     _check_ring(ring)
     n = len(ring)
     if len(sig.c) != n or len(sig.z) != n:
@@ -321,12 +329,12 @@ def trace(
     re-verify here so that callers can choose to amortise that cost — but the
     result on unverified inputs is undefined.
 
-    .. note::
-       For the degenerate ring of size ``n = 1``, the "all columns match" and
-       "exactly one column matches" cases coincide; the function returns
-       ``status="linked"`` even for distinct messages by the lone signer.
-       Anonymity is undefined for ``n = 1`` regardless, so callers should
-       require ``n ≥ 2`` for any realistic voting use.
+    Following FS07, the messages decide between the two "same signer"
+    outcomes: equal messages with every column shared are ``linked``;
+    different messages sharing a column are a ``double-sign``. With
+    ``n >= 2`` two signatures on different messages can share at most one
+    column (sharing two would force equal ``A0``). With ``n = 1`` the single
+    column is the signer's tag, so different messages are a double-sign too.
     """
     _check_ring(ring)
     n = len(ring)
@@ -340,8 +348,10 @@ def trace(
 
     matches = [j for j in range(n) if col1[j].raw == col2[j].raw]
 
-    if len(matches) == n:
-        return TraceResult(status="linked")
+    if m1 == m2:
+        if len(matches) == n:
+            return TraceResult(status="linked")
+        return TraceResult(status="independent")
     if len(matches) == 1:
         idx = matches[0]
         return TraceResult(

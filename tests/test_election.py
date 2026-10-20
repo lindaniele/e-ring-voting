@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from voting import auditor as auditor_mod
 from voting import manager as mgr
 from voting import voter as vt
+from voting.log import BulletinBoard
 from voting.records import (
     Ballot,
     ElectionSetup,
@@ -138,18 +139,43 @@ class TestDoubleSign:
         assert len(report.double_sign_culprits) == 1
         assert report.double_sign_culprits[0].point.raw == voters[0].pk.point.raw
 
-    def test_linked_same_message_counts_once(self, log_path, cohort, now):
+    def test_manager_refuses_linked_ballot(self, log_path, cohort, now):
         _open_election(log_path, cohort, now=now)
         voters = _register_n_voters(log_path, cohort, 3)
         mgr.publish_ring(log_path=log_path, cohort=cohort)
         ctx = vt.load_voting_context(log_path)
-        for _ in range(2):
-            b = vt.cast_ballot(voter=voters[0], context=ctx, choice="yes")
+        b = vt.cast_ballot(voter=voters[0], context=ctx, choice="yes")
+        mgr.publish_ballot(log_path=log_path, cohort=cohort, ballot=b)
+        with pytest.raises(ValueError, match="replay"):
             mgr.publish_ballot(log_path=log_path, cohort=cohort, ballot=b)
+        # Re-signing the same choice is also linked (same A1).
+        again = vt.cast_ballot(voter=voters[0], context=ctx, choice="yes")
+        with pytest.raises(ValueError, match="replay"):
+            mgr.publish_ballot(log_path=log_path, cohort=cohort, ballot=again)
+
+    def test_replayed_copies_neither_drop_votes_nor_frame(self, log_path, cohort, now):
+        # Regression: copies of two honest ballots with different choices
+        # used to be attributed to ring position 1, voiding both votes and
+        # accusing an innocent voter. A publisher that skips the manager's
+        # replay check must not be able to cause that.
+        _open_election(log_path, cohort, now=now)
+        voters = _register_n_voters(log_path, cohort, 4)
+        mgr.publish_ring(log_path=log_path, cohort=cohort)
+        ctx = vt.load_voting_context(log_path)
+        ya = vt.cast_ballot(voter=voters[2], context=ctx, choice="yes")
+        nb = vt.cast_ballot(voter=voters[3], context=ctx, choice="no")
+        board = BulletinBoard(log_path)
+        for ballot in (ya, nb, ya, nb):
+            board.append(
+                ballot.to_payload(),
+                cohort.sks[: cohort.threshold],
+                cohort.as_publisher_cohort(),
+            )
         mgr.close_voting(log_path=log_path, cohort=cohort)
         report = auditor_mod.audit(log_path=log_path)
-        assert report.tally == {"yes": 1, "no": 0}
+        assert report.tally == {"yes": 1, "no": 1}
         assert report.double_sign_culprits == []
+        assert sorted(r for _, r in report.rejected_ballot_indices) == ["replay", "replay"]
 
 
 # --------------------------------------------------------------------------- #
@@ -184,9 +210,9 @@ class TestAdversaries:
         mgr.publish_ring(log_path=log_path, cohort=cohort)
         ctx = vt.load_voting_context(log_path)
         good_ballot = vt.cast_ballot(voter=voters[0], context=ctx, choice="yes")
-        raw = bytearray(b64decode(good_ballot.otrs_sig_b64))
-        raw[10] ^= 0xFF
-        tampered = Ballot(choice="yes", otrs_sig_b64=b64encode(bytes(raw)).decode())
+        raw = bytearray(b64decode(good_ballot.trs_sig_b64))
+        raw[-1] ^= 0x01  # last byte of z_n: still parses, no longer verifies
+        tampered = Ballot(choice="yes", trs_sig_b64=b64encode(bytes(raw)).decode())
         mgr.publish_ballot(log_path=log_path, cohort=cohort, ballot=tampered)
         mgr.close_voting(log_path=log_path, cohort=cohort)
         with pytest.raises(auditor_mod.AuditError):

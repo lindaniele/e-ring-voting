@@ -3,7 +3,7 @@ Typed transactions for the PoW chain.
 
 The chain is **value-bearing** (eVotes) and **poll-bearing** (election
 records). Every transaction has a kind discriminator and a kind-specific
-body. The eight kinds are:
+body. The six kinds are:
 
 ==========================  ===========  ======================================
 kind                        signed by    purpose
@@ -11,24 +11,25 @@ kind                        signed by    purpose
 ``coinbase``                — (none)     mint block reward to miner
 ``transfer``                sender       eVote payment between accounts
 ``setup_poll``              poll creator open a new poll (wraps ElectionSetup)
-``register_voter``          sponsor      register a voter pubkey for a poll
-``publish_ring``            poll creator freeze the voter set into a ring
-``ballot``                  — (none)     submit an OTRS-signed ballot
-``close_poll``              poll creator declare voting closed
-``tally``                   poll creator publish a claimed tally
+``register_voter``          sponsor      register a voter key, lock its deposit
+``ballot``                  — (none)     submit a TRS-signed ballot
+``key_transfer``            — (none)     move a voting right to the next round
 ==========================  ===========  ======================================
 
-**Anonymity note.** The ``ballot`` kind carries *no* Ed25519 sender
-identity and *no* fee — anyone may broadcast a valid OTRS-signed ballot
-and miners are expected to include it (a policy rule enforced by the
-validator). This preserves voter anonymity at the chain layer: a ballot
-on-chain is indistinguishable in metadata across voters in the ring.
+There is no "publish ring", "close" or "tally" transaction: the chain
+freezes the voter set, regroups between rounds, tallies, slashes and
+refunds by itself at the first block past each deadline (see
+:mod:`chain.state`), so no party can stall those steps.
 
-The trade-off is that ballots are not Sybil-priced; spamming
-attacker-generated ballots is prevented by their *OTRS verification
-cost*: only ring members can produce a valid signature. Outside that
-ring, anyone trying to flood the mempool gets their transactions
-rejected at validation time.
+**Anonymity note.** ``ballot`` and ``key_transfer`` carry *no* Ed25519
+sender identity and *no* fee — anyone may broadcast them. This preserves
+voter anonymity at the chain layer: they are indistinguishable in metadata
+across the members of a group.
+
+The trade-off is that they are not priced; spam is bounded instead by the
+TRS rules: only group members can produce a valid signature, a copy of a
+recorded message is invalid, and a signer gets at most two messages per
+tag on chain (the second one exposes them).
 
 Canonical encoding: JSON with ``sort_keys=True`` and
 ``separators=(",", ":")`` over a top-level ``{"kind": ..., "body": ...}``
@@ -59,19 +60,14 @@ class TxKind(str, enum.Enum):
     TRANSFER = "transfer"
     SETUP_POLL = "setup_poll"
     REGISTER_VOTER = "register_voter"
-    PUBLISH_RING = "publish_ring"
     BALLOT = "ballot"
-    CLOSE_POLL = "close_poll"
-    TALLY = "tally"
+    KEY_TRANSFER = "key_transfer"
 
 
 SIGNED_KINDS = frozenset({
     TxKind.TRANSFER.value,
     TxKind.SETUP_POLL.value,
     TxKind.REGISTER_VOTER.value,
-    TxKind.PUBLISH_RING.value,
-    TxKind.CLOSE_POLL.value,
-    TxKind.TALLY.value,
 })
 
 
@@ -236,88 +232,51 @@ def make_register_voter(
     election_id: str,
     registration_payload: bytes,
     fee: int,
+    deposit: int,
     nonce: int,
     sk: ed25519.Ed25519PrivateKey,
 ) -> Transaction:
+    """
+    Register a voter key; the sponsor pays ``fee`` and locks ``deposit``
+    (which must equal the poll's ``ElectionSetup.deposit``).
+    """
     body = {
         "sponsor_pk_b64": b64encode(sponsor_pk_raw).decode(),
         "election_id": str(election_id),
         "registration_payload_b64": b64encode(registration_payload).decode(),
         "fee": int(fee),
+        "deposit": int(deposit),
         "nonce": int(nonce),
     }
     return sign_tx(TxKind.REGISTER_VOTER.value, body, sk)
-
-
-def make_publish_ring(
-    creator_pk_raw: bytes,
-    election_id: str,
-    ring_payload: bytes,
-    fee: int,
-    nonce: int,
-    sk: ed25519.Ed25519PrivateKey,
-) -> Transaction:
-    body = {
-        "creator_pk_b64": b64encode(creator_pk_raw).decode(),
-        "election_id": str(election_id),
-        "ring_payload_b64": b64encode(ring_payload).decode(),
-        "fee": int(fee),
-        "nonce": int(nonce),
-    }
-    return sign_tx(TxKind.PUBLISH_RING.value, body, sk)
 
 
 def make_ballot(election_id: str, ballot_payload: bytes) -> Transaction:
     """
     Anonymous ballot. No Ed25519 signature, no sender, no fee, no nonce.
 
-    Validity is checked by the state machine: the OTRS signature inside
-    ``ballot_payload`` must verify against the published ring for this
-    election, and the choice must be in the option set.
+    Validity is checked by the state machine: the TRS signature inside
+    ``ballot_payload`` must verify against the ballot's group for this
+    election and round, and the choice must be in the option set.
     """
     return Transaction(
         kind=TxKind.BALLOT.value,
         body={
             "election_id": str(election_id),
-            "ballot_payload_b64": b64encode(ballot_payload).decode(),
+            "payload_b64": b64encode(ballot_payload).decode(),
         },
     )
 
 
-def make_close_poll(
-    creator_pk_raw: bytes,
-    election_id: str,
-    closed_payload: bytes,
-    fee: int,
-    nonce: int,
-    sk: ed25519.Ed25519PrivateKey,
-) -> Transaction:
-    body = {
-        "creator_pk_b64": b64encode(creator_pk_raw).decode(),
-        "election_id": str(election_id),
-        "closed_payload_b64": b64encode(closed_payload).decode(),
-        "fee": int(fee),
-        "nonce": int(nonce),
-    }
-    return sign_tx(TxKind.CLOSE_POLL.value, body, sk)
-
-
-def make_tally(
-    creator_pk_raw: bytes,
-    election_id: str,
-    tally_payload: bytes,
-    fee: int,
-    nonce: int,
-    sk: ed25519.Ed25519PrivateKey,
-) -> Transaction:
-    body = {
-        "creator_pk_b64": b64encode(creator_pk_raw).decode(),
-        "election_id": str(election_id),
-        "tally_payload_b64": b64encode(tally_payload).decode(),
-        "fee": int(fee),
-        "nonce": int(nonce),
-    }
-    return sign_tx(TxKind.TALLY.value, body, sk)
+def make_key_transfer(election_id: str, transfer_payload: bytes) -> Transaction:
+    """Anonymous key transfer (wraps :class:`voting.records.KeyTransfer`)."""
+    return Transaction(
+        kind=TxKind.KEY_TRANSFER.value,
+        body={
+            "election_id": str(election_id),
+            "payload_b64": b64encode(transfer_payload).decode(),
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

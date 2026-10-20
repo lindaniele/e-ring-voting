@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "otrs"
-version = "0.1.0"
-description = "Reference implementation of the Scafuro-Zhang one-time traceable ring signature over Ristretto255."
+name = "e-ring-voting"
+version = "0.5.0"
+description = "Anonymous voting on a proof-of-work chain where double-voting costs a deposit: Fujisaki-Suzuki traceable ring signatures, beacon-assigned groups and key transfers."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,7 +13,7 @@ authors = [
     { name = "Daniele Lin" },
     { name = "Niccolò Pagano" },
 ]
-keywords = ["cryptography", "ring-signature", "traceable", "e-voting", "ristretto255"]
+keywords = ["cryptography", "ring-signature", "traceable", "e-voting", "blockchain", "ristretto255"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -26,6 +26,8 @@ dependencies = [
     # because PyNaCl 1.5.0 does not export ristretto255 bindings on systems
     # where libsodium was missing them at build time.
     "cffi>=1.15",
+    # Ed25519 for account and cohort signatures.
+    "cryptography>=41",
 ]
 
 [project.optional-dependencies]
@@ -37,7 +39,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["otrs*"]
+include = ["trs*", "voting*", "chain*"]
 exclude = ["legacy*", "tests*", "bench*"]
 
 [tool.pytest.ini_options]

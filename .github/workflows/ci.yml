@@ -28,4 +28,7 @@ jobs:
       - name: Run tests
         run: python -m pytest -v --tb=short
       - name: Quick benchmark (smoke)
-        run: python -m bench.bench_otrs --sizes 2,4,8 --repeats 2
+        run: |
+          python -m bench.bench_trs --sizes 2,4,8 --repeats 2
+          python -m bench.bench_chain --voters 5 --group-size 2 --difficulty 4
+          python -m bench.bench_groups --cost --anonymity --voters 200 --sizes 4,8 --trials 2 --probe 2,4,8
