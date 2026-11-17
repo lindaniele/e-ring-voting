@@ -14,23 +14,19 @@
 \usepackage{enumitem}
 \usepackage{xcolor}
 \usepackage{listings}
-\usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,fit,shapes.geometric,calc}
 \usepackage[hidelinks,colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
 \usepackage{cleveref}
 \usepackage{framed}
 
-% Loosen line-breaking so long inline identifiers don't overflow.
 \sloppy
 
 % ---- macros ----------------------------------------------------------------
-\newcommand{\G}{\mathbb{G}}
-\newcommand{\Zq}{\mathbb{Z}_q}
+\newcommand{\bits}{\{0,1\}}
 \newcommand{\sk}{\mathit{sk}}
 \newcommand{\pk}{\mathit{pk}}
-\newcommand{\Hzero}{H_0}
-\newcommand{\Hone}{H_1}
-\newcommand{\Htwo}{H_2}
+\newcommand{\Gf}{\mathsf{G}}
+\newcommand{\Hf}{\mathsf{H}}
+\newcommand{\ctx}{\mathit{ctx}}
 \newcommand{\sample}{\xleftarrow{\$}}
 \newcommand{\Sign}{\textsf{Sign}}
 \newcommand{\Verify}{\textsf{Verify}}
@@ -81,13 +77,6 @@
   postbreak=\mbox{\textcolor{gray}{$\hookrightarrow$}\space},
   showstringspaces=false,
 }
-\lstdefinestyle{json}{
-  basicstyle=\ttfamily\footnotesize,
-  backgroundcolor=\color{codebg},
-  frame=single,framesep=4pt,
-  rulecolor=\color{black!15},
-  showstringspaces=false,breaklines=true,
-}
 \lstdefinestyle{pseudo}{
   basicstyle=\ttfamily\small,
   backgroundcolor=\color{codebg},
@@ -97,27 +86,26 @@
   mathescape=true,
 }
 
-\title{\textbf{Engineering Notes:\\ e-ring-voting v0.5}\\[0.4em]
+\title{\textbf{Engineering Notes:\\ e-ring-voting v1.0}\\[0.4em]
        \large Onboarding for a new collaborator}
 \author{Daniele Lin \and Niccol\`o Pagano}
-\date{October 2026}
+\date{November 2026}
 
 \begin{document}
 \maketitle
 
 \begin{quote}
 \itshape
-These notes are for a colleague joining the project. The intended
-reader is a computer-science student who can read Python and knows
-the usual data-structures-and-algorithms toolkit, but has not taken a
-cryptography course. We build every concept from the ground up,
-including the parts that are not cryptography (the bulletin board,
-the state machine, the audit pipeline), and we are honest about which
-problems we have solved and which are still open.
+These notes are for a colleague joining the project. The intended reader
+is a computer-science student who can read Python and knows the usual
+data-structures-and-algorithms toolkit, but has not taken a cryptography
+course. We build every concept from the ground up, from hash functions to
+the signature scheme to the chain, and we are honest about which problems
+we have solved and which are still open.
 
 By the end you should be able to read every file in the repository,
-explain what each one does and why, and decide which of the open
-problems you would attack first.
+explain what each one does and why, and decide which of the open problems
+you would attack first.
 \end{quote}
 
 \tableofcontents
@@ -127,90 +115,58 @@ problems you would attack first.
 \section{The thing we are building}
 % ===========================================================================
 
-A small program that lets a group of people vote on something and gives
-two guarantees that look like they contradict each other:
+A system that lets a group of people vote and gives two guarantees that
+look like they contradict each other:
 
 \begin{itemize}[leftmargin=*]
-  \item \textbf{Nobody knows how you voted.} Not the organisers, not
-    the developers, not anyone who reads the public record of the
-    election.
-  \item \textbf{Anyone can verify the count.} Given the public record,
-    you can re-compute the result yourself and refuse to accept a
-    different one.
+  \item \textbf{Nobody knows how you voted.} Not the organisers, not the
+    miners, not anyone who reads the public record.
+  \item \textbf{Anyone can verify the count}, and in particular that no
+    voter voted twice.
 \end{itemize}
 
 \noindent
-The contradiction is only apparent. The system makes \emph{each
-individual ballot} look like a sealed envelope (you can prove a
-legitimate voter signed it, but not which one), while \emph{the pile
-of all envelopes} can be tallied honestly by anyone. The trick that
-makes this work is a cryptographic primitive called a \emph{traceable
-ring signature} (TRS, Fujisaki and Suzuki~\cite{FS07}), which we
-describe in \cref{sec:ringsigs}.
+The system makes \emph{each ballot} look like a sealed envelope: you can
+check that a legitimate voter signed it, but not which one. The pile of
+envelopes can be tallied by anyone. The primitive behind it is a
+\emph{one-time traceable ring signature} (Scafuro and Zhang~\cite{SZ21},
+\cref{sec:otrs}): a key may sign once and stays anonymous; if it signs a
+second time, \emph{anything}, everybody learns which key it was.
 
-A traceable ring signature also does something more: if you sign
-\emph{twice}, it tells everybody who you are. The project is about using
-that on a chain with money, so that voting twice costs you a deposit
-without anyone having to judge you. The pieces:
+The project uses that on a chain with money: when a voter registers, a
+deposit is locked; if its key is ever exposed, the chain burns the
+deposit. Nobody has to judge anybody, because the evidence is two valid
+signatures that anyone can check. The pieces:
 
 \begin{enumerate}[leftmargin=*]
-  \item The primitive (\file{trs/}, $\sim 1$\,k LOC).
-  \item The election logic shared by both systems: records, group
-    assignment, classification (\file{voting/records.py},
-    \file{groups.py}, \file{tally.py}).
-  \item \textbf{The design} (\file{chain/}, $\sim 2.2$\,k LOC): a
-    proof-of-work chain with per-voter deposits burned on double-signing,
-    voter groups drawn from a block hash, and key transfers between
-    rounds. \Cref{sec:chain}.
-  \item \textbf{The baseline} (the rest of \file{voting/}): a
-    federated bulletin board signed by a $t$-of-$N$ publisher cohort with
-    a $k$-of-$M$ witness federation, one ring, no deposits.
+  \item The primitive (\file{otrs/}, about 750 lines of Python).
+  \item The election logic: poll records and key labels, group assignment,
+    classification (\file{voting/}).
+  \item The chain (\file{chain/}): a proof-of-work blockchain whose
+    validation rules \emph{are} the voting protocol: deposits, groups drawn
+    from a block hash, key transfers between rounds, tally and settlement.
+  \item A comparison scheme (\file{fs07/}): the Fujisaki--Suzuki traceable
+    ring signature~\cite{FS07} that the 2021--22 prototype implemented, with
+    its bugs fixed, used only to measure what the one-time scheme costs.
 \end{enumerate}
 
-The system-layer sections (\cref{sec:system,sec:dec,sec:audit,sec:worked})
-use the baseline to introduce logs, state machines and audits, because
-it is the simplest setting; \cref{sec:chain} then builds the design on
-top of the same ideas.
-
-\paragraph{Concrete scale.} Tens to a few hundred voters
-(university councils, union boards, neighbourhood associations,
-small political parties). Not nation-scale; we will say where the
-limits are and what would need to change.
+\paragraph{Concrete scale.} Tens to a few thousand voters (councils,
+unions, associations, small parties). Not nation-scale.
 
 % ===========================================================================
 \section{How to read these notes}
 % ===========================================================================
 
-\Cref{sec:toolkit} is the cryptographic background. Read it
-even if you think you know hashes and signatures, because we introduce
-\emph{groups}, \emph{ring signatures}, and \emph{trace tags}, which you
-probably haven't seen.
+\Cref{sec:toolkit} is the cryptographic background: hashes, commitments,
+signatures, ring signatures and their three flavours. \Cref{sec:otrs} is
+the scheme we use, in full, with a worked example and the arguments for
+why it works. \Cref{sec:chain} is the design: how the chain turns the
+scheme into a voting protocol. \Cref{sec:code} maps every concept to its
+file. \Cref{sec:fs07} explains why we use this scheme and not the one the
+prototype used. \Cref{sec:open} lists open problems, and
+\cref{sec:assessment} is a critical assessment.
 
-\Cref{sec:system} is the system layer: how the
-ledger works, what entries look like, how the state machine is
-enforced. This is the part of the project that is just careful
-software engineering --- no exotic crypto required.
-
-\Cref{sec:dec} explains why and how the system is decentralised
-(threshold signing + a witness federation).
-
-\Cref{sec:audit} explains the audit algorithm step by step --- this
-is the function that makes ``verifiable'' actually true.
-
-\Cref{sec:worked} walks through a complete election with concrete
-data.
-
-\Cref{sec:chain} is the design: deposits, groups, transfers, and how
-the chain enforces them.
-
-\Cref{sec:code} maps every concept to the file that implements it.
-
-\Cref{sec:open} lists the open problems --- this is where you would
-contribute. \Cref{sec:assessment} is the honest critical assessment
-of whether we have ``finally'' built an anonymous and verifiable
-voting system.
-
-If you only have one hour, read \cref{sec:ringsigs,sec:trace},
+If you only have one hour, read \cref{sec:ringsigs,sec:otrs-scheme},
 \cref{sec:chain} and \cref{sec:open}.
 
 % ===========================================================================
@@ -218,1300 +174,570 @@ If you only have one hour, read \cref{sec:ringsigs,sec:trace},
 \label{sec:toolkit}
 % ===========================================================================
 
-We build the cryptographic vocabulary one concept at a time. Each
-sub-section introduces one idea, says what it is good for, and
-shows the math last (because the math becomes much easier to read
-once you know what it is trying to do).
-
 \subsection{Hash functions}
 
-A \emph{hash function} is a deterministic recipe that maps any input
-(a string, a file, a number) to a fixed-size output. We use
-SHA-256, which produces 32 bytes.
+A \emph{hash function} maps any input to a fixed-size output. We use
+SHA-256 (32 bytes) and SHAKE256, which is the same family as SHA-3 but
+produces as many output bytes as you ask for.
 
 \begin{intuition}
 A fingerprint. Two different inputs almost certainly produce two
-different fingerprints. Given a fingerprint, you cannot recover the
-input.
+different fingerprints. Given a fingerprint, you cannot recover the input.
 \end{intuition}
 
 \noindent
-For our purposes a hash function $H$ has three properties:
+Three properties: \textbf{deterministic}; \textbf{collision-resistant}
+(nobody can find $x \ne y$ with $H(x) = H(y)$); \textbf{one-way} (given
+$H(x)$ you cannot find $x$, or any other preimage, except by guessing).
 
+\paragraph{Random oracles.} Security proofs often pretend that a hash is a
+\emph{random oracle}: a box that answers every new question with fresh
+random bits and repeats its answer to old questions. Real hashes are not
+random oracles, but no attack is known that exploits the difference for
+well-designed schemes, and the model makes proofs tractable.
+Everything in our signature scheme is a random oracle; there is no other
+assumption.
+
+\paragraph{Domain separation.} We use SHAKE256 for several different
+oracles. To make them independent, each one starts by absorbing its own
+prefix, e.g.\ \texttt{SZ21-OTRS-SHAKE256-v1/L128/G/}. Two oracles with
+different prefixes behave like unrelated functions.
+
+\paragraph{Pseudorandom generator.} A function $\Gf : \bits^\lambda \to
+\bits^{3\lambda}$ that stretches a short random \emph{seed} into a longer
+string that looks random. Here $\lambda$ is the \emph{security parameter}:
+128 or 256. We build $\Gf$ from SHAKE256.
+
+\subsection{XOR}
+
+$a \oplus b$ is bitwise exclusive or. Three facts are used constantly:
+$a \oplus a = 0$, $a \oplus 0 = a$, and $(a \oplus b) \oplus b = a$. XOR
+with a random string hides a value perfectly (one-time pad).
+
+\subsection{Commitments}
+\label{sec:commit}
+
+A \emph{commitment} lets you fix a value now and reveal it later.
+
+\begin{intuition}
+A sealed envelope on the table. Once it is there you cannot change what is
+inside (\emph{binding}), and nobody can read it until you open it
+(\emph{hiding}).
+\end{intuition}
+
+\paragraph{Naor's bit commitment~\cite{Naor91}.} The receiver picks a random
+string $\rho$ of $3\lambda$ bits. To commit to a bit $b$, the sender picks
+a seed $r$ and sends
+\[ c = \Gf(r) \oplus b\cdot\rho \qquad(\text{that is, } \Gf(r)
+\text{ if } b = 0,\ \Gf(r) \oplus \rho \text{ if } b = 1). \]
+To open it, the sender reveals $(b, r)$ and the receiver recomputes $c$.
 \begin{itemize}[leftmargin=*]
-  \item \textbf{Deterministic.} $H(x) = H(x)$ for the same $x$.
-  \item \textbf{Collision-resistant.} It is computationally infeasible
-    to find $x \ne y$ with $H(x) = H(y)$.
-  \item \textbf{One-way.} Given $H(x)$ you cannot find $x$ (other than
-    by guessing).
+\item \textbf{Hiding}: $\Gf(r)$ looks random, so $c$ says nothing about $b$.
+\item \textbf{Binding}: to open $c$ both ways you need $r_0, r_1$ with
+      $\Gf(r_0) = \Gf(r_1) \oplus \rho$, i.e.\ $\Gf(r_0) \oplus \Gf(r_1)
+      = \rho$. There are $2^{2\lambda}$ pairs of seeds but $2^{3\lambda}$
+      possible $\rho$, so for a random $\rho$ such a pair almost surely
+      does not exist.
 \end{itemize}
 
-\noindent
-We use hashes for two jobs:
+\paragraph{Equivocal mode: the trapdoor.} Now let the \emph{sender} build
+$\rho$ itself, from two seeds:
+\[ \rho = \Gf(s^0) \oplus \Gf(s^1). \]
+It looks exactly as random as before. But now the sender can commit with
+$c = \Gf(s^0)$ and decide \emph{later} which bit it was: open as $0$ with
+$s^0$ (since $c = \Gf(s^0)$), or as $1$ with $s^1$ (since $\Gf(s^1) \oplus
+\rho = \Gf(s^0) = c$).
 
-\begin{itemize}[leftmargin=*]
-  \item To chain the ledger entries (each entry contains
-    $h_{\mathit{prev}} = H(\text{previous entry})$, so tampering with
-    history is detectable).
-  \item To derive challenges inside the TRS scheme. When the TRS
-    construction needs a ``random'' value that depends on a transcript
-    (so all parties agree on it), we use a hash of the transcript.
-    This trick has a name --- the \emph{Fiat--Shamir transform} --- but
-    you don't need to remember the name to use it.
-\end{itemize}
-
-\subsection{Public-key cryptography in 60 seconds}
-
-In symmetric cryptography Alice and Bob share a secret key and use it
-to encrypt and decrypt. In \emph{public-key} cryptography each person
-has two keys:
-
-\begin{itemize}[leftmargin=*]
-  \item a \emph{secret key} $\sk$ (kept private);
-  \item a \emph{public key} $\pk$ (published).
-\end{itemize}
-
-\noindent
-The two are mathematically linked. Given $\sk$, computing $\pk$ is
-easy. Given $\pk$, computing $\sk$ is computationally infeasible.
-
-Public-key cryptography lets you do two kinds of operation:
-
-\begin{enumerate}[leftmargin=*]
-  \item \emph{Encrypt to Alice} using her $\pk$; only her $\sk$
-    decrypts. (We don't use this in this project.)
-  \item \emph{Sign with Alice's $\sk$}; anyone with her $\pk$ can
-    verify the signature. This is what we use everywhere.
-\end{enumerate}
+\begin{intuition}
+An envelope with a false bottom that only its maker knows about. The key
+observation of the whole project: if the maker opens the \emph{same}
+envelope once as $0$ and once as $1$, it has shown both $s^0$ and $s^1$,
+and anybody can check that $\Gf(s^0) \oplus \Gf(s^1) = \rho$. The false
+bottom is exposed, and so is whoever made it.
+\end{intuition}
 
 \subsection{Digital signatures}
 
-A digital signature is a chunk of bytes that proves a message was
-endorsed by the holder of a specific secret key.
+A digital signature proves that a message was endorsed by the holder of a
+secret key: $\KeyGen() \to (\sk, \pk)$, $\Sign(\sk, m) \to \sigma$,
+$\Verify(\pk, m, \sigma) \to$ true/false.
 
-\begin{intuition}
-A wax seal on a letter. The seal proves the king sent it. If you
-change the letter, the seal breaks. Only the king has the stamp.
-\end{intuition}
-
-\noindent
-Formally, a signature scheme is three algorithms:
-
-\begin{lstlisting}[style=pseudo]
-$\KeyGen$()  $\to$  $(\sk, \pk)$
-$\Sign$($\sk$, $m$)        $\to$  $\sigma$
-$\Verify$($\pk$, $m$, $\sigma$)  $\to$  $\{\text{true}, \text{false}\}$
-\end{lstlisting}
-
-\noindent
-We use \textbf{Ed25519} (a specific signature scheme) for every
-``ordinary'' signature in the system: the organisers signing each
-entry on the ledger, the witnesses signing checkpoints, the
-attestations.
-
-Ed25519 signatures are 64 bytes. Public keys are 32 bytes. They are
-fast (microseconds per verification) and have audited
-implementations. We use the \texttt{cryptography} Python library
-(which wraps OpenSSL).
-
-\begin{flagbox}[Why two schemes?]
-Voters do \emph{not} sign their ballots with Ed25519. They use a
-different scheme called a \emph{ring signature} that hides which voter
-signed (\cref{sec:ringsigs}). Ed25519 is for the parts of the
-system where identity \emph{is} supposed to be visible (the organisers,
-the witnesses).
-\end{flagbox}
-
-\subsection{Groups (the algebra you actually need)}
-
-Many cryptographic primitives use \emph{groups}. This is one piece of
-abstract algebra that you can't completely avoid, but the working
-vocabulary is small.
-
-\begin{intuition}
-A group is a set $\G$ of objects that you can ``add'' together, where
-adding behaves like ordinary addition: there is an identity element
-$0$, every element has an inverse, and $(a + b) + c = a + (b + c)$.
-
-If you can repeatedly add an element to itself, you can also
-``multiply'' it by an integer: $g + g + g = 3 \cdot g$. So a group
-has \emph{scalar multiplication} by integers.
-\end{intuition}
-
-For us the relevant group is \textbf{Ristretto255}. The set has
-$\approx 2^{252}$ elements. The technical details don't matter; what
-matters is the operations and their cost:
-
-\begin{table}[h]
-\centering\small
-\begin{tabular}{lll}
-\toprule
-Operation & Notation & Speed \\
-\midrule
-group element + group element & $P + Q$ & fast (microseconds) \\
-integer $\times$ group element & $a \cdot P$ & a few hundred microseconds \\
-hash bytes $\to$ group element & $H(x) \in \G$ & microseconds \\
-\textbf{discrete logarithm} & given $P, a \cdot P$, find $a$ & \textbf{infeasible} ($> 2^{128}$ ops) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\noindent
-The last row is the security assumption all our cryptography stands
-on. We pick a generator $g \in \G$ (a fixed, public element), and we
-treat $g, 2g, 3g, \ldots$ as a one-way ``ladder'': you can climb up
-easily, but given a rung you cannot find the step number.
-
-This lets us define a \emph{public key} as $\pk = x \cdot g$, where
-$x$ is a random integer. The secret key is $x$. Given $\pk$,
-recovering $x$ would require solving the discrete logarithm, which we
-believe is hard.
-
-\begin{flagbox}[Notation warning]
-Cryptography papers traditionally use multiplicative notation
-($g^x$ instead of $x \cdot g$). We follow that convention in the rest
-of these notes because the FS07 paper does. So $h^{x_i}$ means
-``add $h$ to itself $x_i$ times'' in the additive view, or ``raise
-$h$ to the $x_i$-th power'' in the multiplicative view. Either way,
-it's a group element.
-\end{flagbox}
-
-A \emph{group order} $q$ is the number of distinct elements in $\G$.
-For Ristretto255, $q = 2^{252} + 27742317777372353535851937790883648493$.
-Adding $q$ copies of any element gives the identity. The exponents we
-work with are integers mod $q$, which we write $\Zq$.
-
-\subsection{Hash-to-curve}
-\label{sec:h2c}
-
-The TRS scheme needs to convert arbitrary bytes into group elements
-in a deterministic, well-mixed way. (Concretely: ``the issue
-identifier mixed with the ring of voter pks'' must become a group
-element $h$ that everyone in the system agrees on.) The technique is
-called \emph{hash-to-curve}.
-
-We use the random-oracle suite from RFC~9380~\cite{RFC9380}:
-
-\begin{lstlisting}[style=pseudo]
-input bytes  $\xrightarrow{\text{expand\_message\_xmd, SHA-512}}$  64 uniform bytes
-                 $\xrightarrow{\text{ristretto255\_from\_hash}}$  group element
-\end{lstlisting}
-
-\noindent
-For hashing to scalars (integers mod $q$) we use the same expander
-followed by a reduction:
-\begin{lstlisting}[style=pseudo]
-input bytes  $\to$  64 uniform bytes  $\to$  reduce mod $q$  $\to$  scalar in $\Zq$.
-\end{lstlisting}
-
-\noindent
-Both functions are pinned to specific \emph{domain-separation tags}
-that begin with \mbox{\texttt{FS07-TRS-v1-}}\allowbreak\mbox{\texttt{RISTRETTO255-}}\allowbreak\mbox{\texttt{XMD:SHA-512-...}}
-so that changing the algebra forces a protocol version bump.
+We use \textbf{Ed25519} for every signature where identity \emph{is}
+supposed to be visible: accounts that pay, sponsors that register voters,
+creators that open polls. Voters do not use it for ballots.
 
 \subsection{Ring signatures}
 \label{sec:ringsigs}
 
-This is where things get interesting. A \emph{ring signature} lets you
-sign on behalf of a set of public keys (the ``ring'') without
-revealing which key was used.
+A \emph{ring signature}~\cite{RST01} is signed with one secret key and
+verified against a list of public keys, the \emph{ring}. It proves ``one of
+these people signed'' and hides which one.
 
 \begin{intuition}
-A sealed envelope labelled ``one of these $n$ people signed this''.
-You can verify the seal. You cannot tell who broke it open.
+A room of people behind a curtain. A note comes out under the curtain. You
+can check that it came from someone in the room, but not from whom.
 \end{intuition}
 
 \noindent
-Concretely the public interface looks like this:
+For voting this is half of what we need. The other half is stopping a
+voter from slipping two notes under the curtain. There are three
+flavours:
 
-\begin{lstlisting}[style=pseudo]
-$\Sign$(my $\sk$, message, ring = [$\pk_1$, $\pk_2$, ..., $\pk_n$])  $\to$  $\sigma$
-$\Verify$($\sigma$, message, ring)  $\to$  $\{\text{true}, \text{false}\}$
-\end{lstlisting}
-
-\noindent
-And the security property is:
-
-\begin{quote}
-\itshape Anyone who verifies $\sigma$ learns ``one of the keys in the
-ring signed this'' --- and nothing more.
-\end{quote}
-
-The classical construction (Rivest, Shamir, Tauman, 2001) works like
-this in spirit:
-
-\begin{enumerate}[leftmargin=*]
-  \item The real signer is at position $i$ and knows $\sk_i$.
-  \item For every other position $j \ne i$, the signer picks
-    \emph{random} values that look like a partial proof.
-  \item Those random values, together, leave one missing piece in
-    a global equation.
-  \item The signer uses their secret $\sk_i$ to compute the missing
-    piece so that the equation balances.
-\end{enumerate}
-
-\noindent
-From outside, all $n$ positions look identical --- random-looking
-data tied together by an equation that only closes if at least one
-secret key was used. Anyone can verify ``yes, someone in this ring
-signed'' but the position is hidden.
-
-\paragraph{The new problem this creates.} If a ring signature is
-perfectly anonymous, what stops the same voter from signing 100
-ballots? Each one verifies fine; each one is anonymous. This is the
-sub-problem traceable ring signatures solve.
-
-\subsection{Trace tags: traceable ring signatures}
-\label{sec:trace}
-
-The idea of Fujisaki and Suzuki's traceable ring signature~\cite{FS07}
-is to add a \emph{deterministic} tag to every signature, tied to
-\emph{(signer, issue, ring)}, in a way that:
-
-\begin{itemize}[leftmargin=*]
-  \item Looking at a single tag, you cannot tell whose it is.
-  \item Two signatures by the same voter on the \emph{same issue}
-    produce equal trace tags.
-  \item Comparing two tags reveals nothing else.
-\end{itemize}
-
-\begin{intuition}
-Imagine an envelope that turns transparent only if you mail two of
-them. One envelope = anonymous. Two envelopes by the same person =
-publicly transparent (you learn who sent both).
-\end{intuition}
-
-The math. Fix an issue $I$ (the election identifier) and a ring
-$R = (\pk_1, \ldots, \pk_n)$. Compute
-$h = \Hzero(I \| R)$ --- a group element that depends only on the
-election and the ring, not on the message. The \emph{trace tag} for
-voter $i$ (secret key $x_i$, public key $\pk_i = g^{x_i}$) is
-
-\[
-  \sigma_i \;=\; h^{x_i}.
-\]
-
-\noindent
-Notice: $\sigma_i$ depends only on $(h, x_i)$ which depend only on
-$(I, R, x_i)$. The message $m$ does not appear. So if voter $i$ signs
-two messages $m_1 \ne m_2$ on the same election, both signatures embed
-the same $\sigma_i$.
-
-\paragraph{How does the signature embed $\sigma_i$ without leaking the
-position $i$?} It encodes the trace tag through two ``signature
-points'' $A_0$ and $A_1$ that satisfy
-\[
-  \sigma_j \;=\; A_0 \cdot A_1^{\,j} \qquad \text{for every $j$ in the ring.}
-\]
-$A_0$ depends on the message (so it's different across messages);
-$A_1$ is chosen by the signer to make the equation hold at $j = i$
-(see the full construction below). Anyone verifying the
-signature computes the full vector $(\sigma_1, \ldots, \sigma_n)$ from
-$A_0, A_1$. Each $\sigma_j$ looks like a random element. \emph{Only}
-when you have two signatures and compare component-by-component does
-the trace tag's invariance show up: the real signer's column matches.
-
-The trace algorithm, then, compares the two $\sigma$ vectors position
-by position, and looks at the two messages. Same message and all
-positions matching $\Rightarrow$ \emph{linked}: the same signer said the
-same thing (typically a copy); count it once, blame nobody. Different
-messages and exactly one matching position $\Rightarrow$ that position
-is the double-signer. Otherwise $\Rightarrow$ two independent signers.
-
-\begin{flagbox}[Issue]
-\textbf{$h$ must be a real hash to the group.} If anyone knows $t$ with
-$h = g^t$, they can compute $\pk_j^{\,t} = h^{x_j}$ for every member and
-compare with the columns of a single signature: anonymity is gone. The
-2021 prototype computed $h$ exactly that way, with $t$ derived from
-public data, and nothing in its demo showed it. It also inverted $i$
-modulo the field prime instead of the group order, so only position~1
-produced valid signatures.
-\end{flagbox}
-
-\paragraph{The full signing algorithm.} For completeness, the
-signature $\sigma = (A_1, c_1, \ldots, c_n, z_1, \ldots, z_n)$ is
-produced as follows. The signer:
-
-\begin{enumerate}[leftmargin=*]
-  \item Sets $h \gets \Hzero(I \| R)$ and $\sigma_i \gets h^{x_i}$
-    (the trace tag).
-  \item Sets $A_0 \gets \Hone(I \| R \| m)$.
-  \item Computes $A_1 \gets (\sigma_i / A_0)^{1/i}$ so that
-    $A_0 \cdot A_1^{\,j}$ correctly gives $\sigma_i$ at $j = i$ and
-    can be used by the verifier at every other $j$.
-  \item For each $j \ne i$ picks random $c_j, z_j \sample \Zq$ and
-    computes ``simulated'' proof points
-    $a_j \gets g^{z_j} \pk_j^{c_j}$ and $b_j \gets h^{z_j} \sigma_j^{c_j}$.
-  \item For $j = i$ picks random $w \sample \Zq$ and sets
-    $a_i \gets g^w$, $b_i \gets h^w$.
-  \item Computes the global challenge
-    $c^* \gets \Htwo(I \| R \| A_0 \| A_1 \| a_{1..n} \| b_{1..n})$.
-  \item Sets the missing piece $c_i \gets c^* - \sum_{j \ne i} c_j$
-    and $z_i \gets w - c_i x_i$.
-\end{enumerate}
-
-\noindent
-The verifier recomputes everything and checks
-$\sum_j c_j \equiv c^* \pmod q$. The signature size is
-$32 + 4 + 64n$ bytes ($A_1$, length prefix, $2n$ scalars).
-
-This is the cryptographic core. In code: \file{trs/trs.py}. Read
-the functions \texttt{sign}, \texttt{verify}, \texttt{trace}; the
-math above maps line-for-line.
-
-% ===========================================================================
-\section{The system layer}
-\label{sec:system}
-% ===========================================================================
-
-The crypto in \cref{sec:toolkit} gives us one-vote-per-voter with
-anonymity. Turning that into an election system requires a few more
-pieces. None of these are cryptographic --- they are just careful
-software engineering.
-
-This section and the next three describe the \emph{baseline}
-(\file{voting/}): a bulletin board run by a named cohort. It is the
-simplest place to learn what a log, a state machine and an audit are.
-The design in \cref{sec:chain} keeps the same records and the same
-classification, and replaces the cohort with a chain.
-
-\subsection{The bulletin board (a JSON-Lines file)}
-\label{sec:bb}
-
-The whole history of an election is stored in one file. Each line of
-the file is one JSON object called an \emph{entry}. Entries are
-append-only: once written, they don't get edited.
-
-\begin{intuition}
-A notebook in a public square. Anyone can read it. Only the organisers
-can write. Every page is dated, signed, and links to the previous
-page.
-\end{intuition}
-
-\noindent
-An entry has the following shape:
-
-\begin{lstlisting}[style=json]
-{
-  "index":     0,
-  "prev_hash": "AAAA...",
-  "timestamp": 1716580800,
-  "payload":   "eyJraW5kIjogImVsZWN0aW9uX3NldHVwIiwgLi4u",
-  "publisher_sigs": [
-     {"i": 0, "sig": "Cg7q..."},
-     {"i": 1, "sig": "Tp1m..."}
-  ]
-}
-\end{lstlisting}
-
-\noindent
-The fields:
-
-\begin{itemize}[leftmargin=*]
-  \item \texttt{index} --- entry number, starting at 0 and contiguous.
-  \item \texttt{prev\_hash} --- SHA-256 of the previous entry (the
-    \emph{hash chain}; explained below).
-  \item \texttt{timestamp} --- Unix seconds, monotonically non-decreasing.
-  \item \texttt{payload} --- base64-encoded JSON of one of six record
-    types (\cref{sec:records}).
-  \item \texttt{publisher\_sigs} --- a list of $(i, \sigma)$ pairs,
-    each a signature by cohort member $i$. We require at least
-    $t$ distinct members to have signed (the \emph{threshold},
-    \cref{sec:cohort}).
-\end{itemize}
-
-\subsection{The hash chain}
-
-The \texttt{prev\_hash} field links each entry to the one before it.
-
-\begin{tikzpicture}[node distance=8mm,
-  block/.style={draw,rounded corners,inner sep=4pt,align=center,fill=blue!4,minimum width=2.5cm,minimum height=1.4cm},
-  arrow/.style={-{Stealth[length=2mm]}, thick}]
-  \node[block] (e0) {Entry 0\\\footnotesize prev = 0...0};
-  \node[block, right=of e0] (e1) {Entry 1\\\footnotesize prev = H(0)};
-  \node[block, right=of e1] (e2) {Entry 2\\\footnotesize prev = H(1)};
-  \node[block, right=of e2] (e3) {Entry 3\\\footnotesize prev = H(2)};
-  \draw[arrow] (e0.east) -- node[above,font=\footnotesize]{$h_0$} (e1.west);
-  \draw[arrow] (e1.east) -- node[above,font=\footnotesize]{$h_1$} (e2.west);
-  \draw[arrow] (e2.east) -- node[above,font=\footnotesize]{$h_2$} (e3.west);
-\end{tikzpicture}
-
-\noindent
-Why this is useful: if anyone tampers with entry 1 (changes a byte),
-its hash $h_1$ changes. Entry 2's \texttt{prev\_hash} still claims the
-old value, so the chain is broken. The auditor catches this in
-$O(N)$ time during verification.
-
-\begin{flagbox}[This is the ``blockchain-flavoured'' bit]
-A hash chain is the data structure underneath Bitcoin's ``blockchain''.
-We use the data structure --- not the rest of Bitcoin. There is no
-proof-of-work, no mining, no currency, no consensus protocol. The
-right reference is Certificate Transparency~\cite{RFC6962}, not
-Bitcoin. See \cref{sec:notblockchain} for why we deliberately skip
-PoW.
-\end{flagbox}
-
-\noindent
-The entry hash $H(\text{entry})$ is computed over the
-\emph{content fields only}, not over the signatures:
-
-\[
-  H(\text{entry}) = \mathsf{SHA256}\!\bigl(
-    \mathtt{index} \,\|\, \mathtt{prev\_hash} \,\|\,
-    \mathtt{timestamp} \,\|\, |\mathtt{payload}| \,\|\, \mathtt{payload}\bigr).
-\]
-
-\noindent
-This means a cohort can collect more signatures on an entry over
-time without changing the chain. Convenient for asynchronous signing
-(\cref{sec:pending}).
-
-\subsection{Record types}
-\label{sec:records}
-
-The \texttt{payload} of an entry is a JSON object with a \texttt{kind}
-field that identifies the record type. There are six:
-
-\begin{table}[h]
-\centering\small
-\begin{tabularx}{\textwidth}{l X}
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{l X X}
 \toprule
-Kind & Content \\
+Flavour & Two signatures by one key \ldots & Consequence \\
 \midrule
-\textsf{ElectionSetup} & Genesis entry. Election ID (32 random bytes,
-also used as the TRS issue $I$), title, options, schedule, cohort
-public keys, threshold $t$, optional witness keys and threshold $k$. \\
-\textsf{VoterRegistration} & A voter's TRS public key plus a
-human-readable handle. \\
-\textsf{RingPublication} & The ordered ring of all registered voter
-pks. After this, registration is closed and voting opens. \\
-\textsf{Ballot} & A voter's choice (one of the options) together with
-their TRS signature. \\
-\textsf{VotingClosed} & A marker. No ballots may appear after this. \\
-\textsf{TallyPublication} & The cohort's claimed final tally. Anyone
-can recompute and refute. \\
+plain & look unrelated & a voter can vote as often as it likes \\
+linkable~\cite{LWW04} & are recognisably linked & the second ballot is discarded; the voter stays anonymous; trying is free \\
+traceable~\cite{FS07} & on different messages (same tag), reveal the key & the voter is exposed; can be punished \\
+one-time traceable~\cite{SZ21} & \emph{any} two, reveal the key & as above, and the rule is simply ``each key signs once'' \\
 \bottomrule
 \end{tabularx}
-\end{table}
-
-\noindent
-Code: \file{voting/records.py}. Each kind is a Python dataclass with
-\texttt{to\_payload} / \texttt{from\_obj} methods. The polymorphic
-parser \texttt{parse\_payload} dispatches by \texttt{kind}.
-
-\subsection{The state machine}
-\label{sec:fsm}
-
-The legal sequence of records is
-
-\[
-  \textsf{Setup} \;\to\; (\textsf{Registration})^* \;\to\;
-  \textsf{Ring} \;\to\; (\textsf{Ballot})^* \;\to\;
-  \textsf{Closed} \;\to\; (\textsf{Tally})?
-\]
-
-\begin{center}
-\begin{tikzpicture}[node distance=12mm,
-  state/.style={draw,rounded corners,inner sep=4pt,fill=blue!4,font=\footnotesize},
-  arrow/.style={-{Stealth[length=2mm]}, thick}]
-  \node[state] (S) {\textsf{Setup}};
-  \node[state, right=of S] (R) {\textsf{Registration*}};
-  \node[state, right=of R] (G) {\textsf{Ring}};
-  \node[state, right=of G] (B) {\textsf{Ballot*}};
-  \node[state, right=of B] (C) {\textsf{Closed}};
-  \node[state, right=of C] (T) {\textsf{Tally}?};
-  \draw[arrow] (S) -- (R); \draw[arrow] (R) -- (G);
-  \draw[arrow] (G) -- (B); \draw[arrow] (B) -- (C);
-  \draw[arrow] (C) -- (T);
-\end{tikzpicture}
 \end{center}
 
 \noindent
-The auditor enforces this regex by walking the log linearly and
-keeping a state variable. Any out-of-order record is rejected. The
-state machine is the simplest possible enforcement of ``ballots after
-ring, no ballots after close''.
+The one-time flavour matches a poll exactly. It also has a property the
+others lack in practice: it is built from a hash function alone, so a
+quantum computer does not break its anonymity (\cref{sec:fs07}).
 
 % ===========================================================================
-\section{Decentralisation}
-\label{sec:dec}
+\section{The one-time traceable ring signature}
+\label{sec:otrs}
 % ===========================================================================
 
-The system described so far has one weak spot: ``the organiser''.
-What if the organiser:
+\subsection{The idea in one paragraph}
 
-\begin{itemize}[leftmargin=*]
-  \item refuses to publish (the election stalls);
-  \item goes offline (the election stalls);
-  \item gets compromised (the attacker rewrites the result);
-  \item lies about the tally (we catch them at audit, but it took us
-    months to set up an election that's now invalid).
-\end{itemize}
+A public key is a list of $\lambda$ trapdoored Naor strings $\pk_1, \ldots,
+\pk_\lambda$ (\cref{sec:commit}). To sign, every ring member gets a
+$\lambda$-bit string $x_i$, committed bit by bit; the signature is valid if
+the XOR of all $x_i$ equals a hash $z$ of everything committed. The
+signer can fake its commitments because it holds the trapdoors: it
+commits first, learns $z$, and then opens its own commitments to whatever
+$x_l$ makes the XOR work out. Everybody else's commitments were opened
+honestly. A verifier sees $N$ correctly opened commitments and cannot tell
+which ones were faked. But each faked opening reveals one of the two seeds
+of a row, and a second signature, with a different $z$, will need some row
+opened the other way: both seeds are out, and the row names its key.
 
-\noindent
-Real elections solve this with \emph{multiple organisers} and rules
-of the form ``any decision requires the agreement of at least $t$
-of them''. We do the same digitally.
+\subsection{The scheme}
+\label{sec:otrs-scheme}
 
-\subsection{The publisher cohort: $t$-of-$N$}
-\label{sec:cohort}
+Notation: $\lambda$ the security parameter, $N$ the ring size, rows
+indexed by $j = 1..\lambda$, ring members by $i = 1..N$, the signer at
+position $l$.
 
-Instead of one organiser with one Ed25519 key, we have a
-\emph{cohort} of $N$ organisers, each holding their own key. Every
-log entry must be co-signed by at least $t$ distinct cohort members
-to be valid.
+\paragraph{\KeyGen.} Pick $2\lambda$ seeds $s^0_j, s^1_j$ of $\lambda$
+bits. Publish $\pk_j = \Gf(s^0_j) \oplus \Gf(s^1_j)$ for $j = 1..\lambda$.
+At $\lambda = 128$ that is 128 rows of 48 bytes: 6\,144 bytes.
 
+\paragraph{\Sign$(\sk_l, R, m, \ctx)$.}
 \begin{lstlisting}[style=pseudo]
-ElectionSetup pins:
-  cohort_pks = [$\pk_0$, $\pk_1$, ..., $\pk_{N-1}$]
-  threshold  = $t$
-
-Entry has:
-  publisher_sigs = [($i_1$, $\sigma_1$), ($i_2$, $\sigma_2$), ...]
-              # at least $t$ distinct indices, each sig valid under cohort_pks[$i$]
+for every member i $\ne$ l:
+    $x_i$ $\sample$ $\{0,1\}^\lambda$                       # its random share
+    for j in 1..$\lambda$:  $r_{i,j}$ $\sample$ seed;  $c_{i,j}$ = G($r_{i,j}$) $\oplus$ $x_i[j]\cdot\pk_{i,j}$
+for j in 1..$\lambda$:      $c_{l,j}$ = G($s^0_{l,j}$)            # signer: undecided
+z  = H($\ctx$, R, m, all $c_{i,j}$)                  # the target
+$x_l$ = z $\oplus$ $\bigoplus_{i\ne l} x_i$                       # signer's share, forced
+for j in 1..$\lambda$:      $r_{l,j}$ = $s^{x_l[j]}_{l,j}$             # open as needed
+output  ($x_1, \ldots, x_N$,  all $r_{i,j}$)              # $N\lambda(\lambda+1)$ bits
 \end{lstlisting}
 
-\noindent
-This gives us two guarantees:
+\paragraph{\Verify.} Recompute every $c_{i,j} = \Gf(r_{i,j}) \oplus
+x_i[j]\cdot\pk_{i,j}$ (it works for the signer too, by the equivocation
+trick), recompute $z$ and check $\bigoplus_i x_i = z$.
 
-\begin{itemize}[leftmargin=*]
-  \item \textbf{Liveness against $N - t$ unavailable members.}
-    Up to $N - t$ cohort members can be offline or refusing to
-    cooperate; the remaining $t$ can still proceed.
-  \item \textbf{Soundness against $t - 1$ corrupted members.}
-    A minority faction smaller than $t$ cannot append on its own.
-\end{itemize}
+\paragraph{\Trace.} Given two valid signatures with seeds $\alpha_{i,j}$
+and $\beta_{i,j}$ on the same ring: member $i$ is traced if, for some row
+$j$, $\Gf(\alpha_{i,j}) \oplus \Gf(\beta_{i,j}) = \pk_{i,j}$.
 
-\noindent
-Common configurations:
+\subsection{A worked example}
 
-\begin{table}[h]
-\centering\small
-\begin{tabular}{lll}
-\toprule
-$t$-of-$N$ & tolerates offline & tolerates corrupt \\
-\midrule
-2-of-3 & 1 & 1 \\
-3-of-5 & 2 & 2 \\
-4-of-7 & 3 & 3 \\
-7-of-10 & 3 & 6 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\noindent
-Pick a configuration that matches your trust model: larger $t$ trades
-liveness for soundness.
-
-\paragraph{Asynchronous signing.}
-Cohort members typically live on different machines. The
-\emph{pending-entry} protocol lets them sign over time:
-
+Take $N = 2$, Alice at position 1, Bob at position 2, Alice signs. Pretend
+$\lambda = 3$ (in reality it is 128).
 \begin{enumerate}[leftmargin=*]
-  \item Any cohort member calls \texttt{propose\_entry(log, payload)}
-    to create a sidecar file \file{<log>.pending}.
-  \item Each cohort member, in any order, calls
-    \texttt{cosign\_pending} to add their signature to the sidecar.
-  \item Once the sidecar has $\ge t$ signatures, anyone calls
-    \texttt{commit\_pending} to move it into the main log.
+\item Bob's share: Alice picks $x_2 = 101$ and seeds $r_{2,1}, r_{2,2},
+      r_{2,3}$, and computes $c_{2,1} = \Gf(r_{2,1}) \oplus \pk_{2,1}$,
+      $c_{2,2} = \Gf(r_{2,2})$, $c_{2,3} = \Gf(r_{2,3}) \oplus \pk_{2,3}$:
+      honest Naor commitments to $1, 0, 1$ under Bob's rows.
+\item Her own: $c_{1,j} = \Gf(s^0_{1,j})$ for $j = 1, 2, 3$.
+\item $z = \Hf(\ldots) = 110$, say. Then $x_1 = 110 \oplus 101 = 011$.
+\item She opens her rows to $0, 1, 1$: $r_{1,1} = s^0_{1,1}$, $r_{1,2} =
+      s^1_{1,2}$, $r_{1,3} = s^1_{1,3}$.
 \end{enumerate}
+A verifier checks four things it can compute: each commitment from its
+opening, $z$ from the commitments, and $011 \oplus 101 = 110$. Both rows
+of commitments were opened correctly; nothing marks Alice's as special.
 
-\label{sec:pending}\noindent
-Code: \file{voting/log.py}. CLI: \texttt{evote propose},
-\texttt{evote sign-pending}, \texttt{evote commit-pending}.
+Now Alice signs a second time. The other share is new, so $z'$ is new,
+say $x'_1 = 001$. Row 1 is opened with $s^0_{1,1}$ again, but row 2 now
+needs $s^0_{1,2}$, and the first signature revealed $s^1_{1,2}$. Anyone
+computes $\Gf(s^1_{1,2}) \oplus \Gf(s^0_{1,2}) = \pk_{1,2}$: row 2 of
+Alice's key. With $\lambda = 128$ rows, the chance that two random
+targets agree on every bit is $2^{-128}$.
 
-\subsection{The witness federation: $k$-of-$M$}
-\label{sec:witnesses}
+\subsection{Why it works}
 
-The cohort layer protects against a corrupt minority. What if a
-corrupt \emph{majority} ($\ge t$ malicious members) collude to publish
-two different versions of the log to different observers?
+\paragraph{Anonymity.} For Bob's position the seeds are fresh random
+seeds. For Alice's they are her secret seeds, which nobody has seen
+before. Both look like random strings of $\lambda$ bits, and the only way
+to tell a secret seed from a fresh one is to find which seed hashes to
+which half of a row, i.e.\ to invert $\Gf$. This holds as long as Alice
+has signed only once: a second signature would put both seeds of some row
+in public.
 
-This is called \emph{equivocation}. Cohort signatures alone cannot
-prevent it (the colluding majority has enough signing power). The
-classical fix is to add an \emph{independent} set of read-only
-checkers: \emph{witnesses}.
+\paragraph{Traceability.} To sign you must open, at some position, a
+commitment you made \emph{before} learning $z$, to a value that depends on
+$z$. You can only do that at a position whose trapdoor you hold. Two
+signatures need two different targets, so at your position the two
+openings differ in some row and reveal both seeds. Scafuro and Zhang prove
+the stronger \emph{public traceability}: $N$ keys together cannot produce
+$N + 1$ valid signatures on one ring without two of them tracing a key.
 
-A witness has their own Ed25519 keypair. Their job is to:
+\paragraph{Exculpability.} To frame Alice you would need both seeds of
+one of her rows. Her single signature shows one; the other never leaves
+her machine. Copying her signature does not help: a copy is identical and
+traces nothing.
 
-\begin{enumerate}[leftmargin=*]
-  \item Fetch the bulletin board.
-  \item Verify it from scratch under the cohort identity.
-  \item Emit a signed \emph{checkpoint} attesting to what they saw:
-    ``at index $i$, the head hash is $h$''.
-\end{enumerate}
+\subsection{Same message, still traced}
 
-\begin{lstlisting}[style=pseudo]
-Checkpoint = (log_index, head_hash, witness_index, sig)
-sig = Ed25519.Sign(witness_sk, "trs-witness-checkpoint-v1" || log_index || head_hash || witness_index)
+With a linkable or an FS07 signature, signing the \emph{same} ballot twice
+is harmless: the two are linked as a copy. Here, if Alice signs ``yes''
+twice with fresh randomness, Bob's share differs, $z$ differs, and she is
+traced. This is the rule ``a key signs once'' taken literally, and it has a
+practical consequence: a wallet that re-signs a ballot because a broadcast
+timed out would cost its user the deposit. Our implementation therefore
+derives all the randomness ($x_i$ and the seeds $r_{i,j}$) from the secret
+and the full input with SHAKE256. Re-signing the same input gives the same
+bytes: a copy, which the chain refuses harmlessly.
+
+\subsection{The zero-row gap}
+\label{sec:zerorow}
+
+\begin{flagbox}[Something the paper missed]
+If a row $\pk_j$ is all zeros, the commitment $\Gf(r) \oplus b\cdot\pk_j =
+\Gf(r)$ is the same for both bits, so \emph{any} seed opens it either way.
+A key made entirely of zero rows (which honest-looking key generation
+produces if $s^0_j = s^1_j$) can sign as often as it likes, each time with
+fresh seeds, and is never traced. The verification algorithm of Fig.~1
+in~\cite{SZ21} does not check for this. Our \file{Ring} refuses every key
+with a zero row; \file{tests/test\_otrs.py::TestZeroRow} runs the attack
+with the check switched off.
+\end{flagbox}
+
+\noindent
+Why the rows are $3\lambda$ bits and not $\lambda$: for a non-zero row, a
+cheater would need two different seed pairs with the same XOR. That is a
+4-XOR problem; with $3\lambda$-bit outputs Wagner's
+algorithm~\cite{Wagner02} needs about $2^\lambda$ work. Shorter rows would
+make it cheap.
+
+\subsection{Sizes and speed}
+
+At $\lambda = 128$ a signature is $N \cdot 129 \cdot 16$ bytes, 2\,064
+bytes per ring member, plus 5 bytes of header; at $\lambda = 256$, four
+times that. Verification costs $128$ SHAKE calls per member: 0.16~ms in our
+Python, 1.3~ms for a ring of 8. A ring of 1\,000 gives 2~MB signatures,
+which is why the design never uses one big ring (\cref{sec:groups}).
+
+\subsection{What our implementation adds}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{A label in every key}: 32 public bytes, hashed into the ring.
+      The chain uses it to bind a key to its single use
+      (\cref{sec:labels}).
+\item \textbf{A context string} inside $\Hf$ (poll and round), and a
+      short digest of the ring instead of the whole ring.
+\item \textbf{A 32-byte master secret} from which the $2\lambda$ seeds are
+      derived, so key files are small.
+\item \textbf{Deterministic signing} and the \textbf{zero-row check} (above).
+\item \textbf{Trace returns every culprit}, because a coalition of keys can
+      split the rows it opens.
+\item \textbf{Trace from cached openings}: verification already computes
+      every $\Gf(r_{i,j})$; we keep them as one big integer, and tracing two
+      signatures becomes $A \oplus B \oplus P$ and a search for an all-zero
+      row: 0.04~ms for $N = 8$.
+\end{itemize}
+
+\begin{lstlisting}[style=py]
+from otrs import Ring, keygen
+voters = [keygen() for _ in range(8)]
+ring = Ring([v.pk for v in voters])
+sig = ring.sign(voters[3], b"yes", b"poll-7")
+assert ring.verify(sig, b"yes", b"poll-7")
+second = ring.sign(voters[3], b"no", b"poll-7")
+ring.trace(sig, second).culprits         # (3,)
 \end{lstlisting}
-
-\noindent
-Checkpoints accumulate in a sidecar file \file{<log>.witnesses}.
-
-\paragraph{What property does this buy us?} If a corrupted majority
-shows two different logs to two different honest witnesses, the two
-checkpoints they emit will have the \emph{same log\_index} but
-\emph{different head\_hash}. Anyone who collects both checkpoints has
-public, undeniable proof that the cohort split. The auditor surfaces
-this as \texttt{EQUIVOCATION}, and the election is invalidated.
-
-\paragraph{What the auditor requires.} If the setup declared
-witnesses, the auditor:
-
-\begin{itemize}[leftmargin=*]
-  \item verifies every checkpoint's signature;
-  \item checks that no two checkpoints sign the same index with
-    different hashes (no equivocation);
-  \item requires at least $k$ distinct witnesses to have co-signed
-    \emph{some} log index (the \emph{witness threshold}).
-\end{itemize}
-
-\noindent
-Code: \file{voting/witness.py}. CLI: \texttt{evote witness-keygen},
-\texttt{evote witness-checkpoint}.
-
-% ===========================================================================
-\section{The principals}
-\label{sec:principals}
-% ===========================================================================
-
-Four kinds of party in the system:
-
-\begin{description}[leftmargin=*]
-  \item[Cohort member.] Holds one Ed25519 secret key. Can propose,
-    co-sign, and commit entries to the main log. Trusted (with the
-    rest of the cohort) to not collude past the threshold.
-    Code: \file{voting/manager.py}.
-  \item[Voter.] Holds one Ristretto255 TRS secret key. Can read the
-    log, build a ballot, and submit it. Identity is verified
-    out-of-band by the cohort during registration; after that the
-    voter's actions are anonymous within the ring.
-    Code: \file{voting/voter.py}.
-  \item[Witness.] Holds one Ed25519 secret key. Cannot write to the
-    main log. Periodically fetches, verifies, and emits checkpoints
-    to the witness sidecar. Code: \file{voting/witness.py}.
-  \item[Auditor.] Anyone. Read-only. Holds no keys. Bootstraps the
-    cohort and witness identities from the Setup entry, then runs the
-    audit pipeline. Code: \file{voting/auditor.py}.
-\end{description}
-
-\begin{center}
-\begin{tikzpicture}[
-  node distance=4mm and 12mm,
-  block/.style={draw,rounded corners,inner sep=5pt,align=center,fill=blue!4,minimum width=2.8cm},
-  arrow/.style={-{Stealth[length=2mm]}, thick},
-  rwarrow/.style={-{Stealth[length=2mm]}, thick, dashed},
-  store/.style={draw,thick,rounded corners,fill=gray!7,inner sep=8pt,align=center}
-]
-\node[block] (V) {Voter\\\footnotesize TRS sk};
-\node[block, right=of V] (Co) {Cohort member $i$\\\footnotesize Ed25519 sk$_i$};
-\node[block, right=of Co] (W) {Witness $j$\\\footnotesize Ed25519 sk$_j$};
-\node[block, right=of W] (A) {Auditor\\\footnotesize read-only};
-
-\node[store, below=10mm of Co] (BB) {bulletin board\\\footnotesize JSON-Lines};
-\node[store, right=of BB] (CP) {checkpoints\\\footnotesize sidecar};
-
-\draw[arrow] (V) -- node[right,font=\footnotesize]{ballot} (BB);
-\draw[arrow] (Co) -- node[right,font=\footnotesize]{co-signs ($t$-of-$N$)} (BB);
-\draw[arrow] (W) -- node[right,font=\footnotesize]{checkpoint} (CP);
-\draw[rwarrow] (A) -- node[right,font=\footnotesize]{verifies} (BB);
-\draw[rwarrow] (A) -- node[right,font=\footnotesize]{verifies} (CP);
-\end{tikzpicture}
-\end{center}
-
-\noindent
-Voters do not need to know who the cohort members are by name; they
-need only the cohort \emph{public keys}, which they read from the
-genesis Setup entry. Auditors do not need any private state; they
-only need the log files.
-
-% ===========================================================================
-\section{The audit algorithm}
-\label{sec:audit}
-% ===========================================================================
-
-The single most important function in the project is
-\texttt{voting.auditor.audit}. It is what makes ``verifiable''
-actually true. It runs in seven steps. If any check fails it raises
-\texttt{AuditError} and the election is invalid.
-
-\paragraph{Step 1: bootstrap.}
-Parse entry 0 as an \textsf{ElectionSetup}. Extract:
-the election ID, the cohort pks, the threshold $t$, the witness pks,
-the witness threshold $k$. All subsequent checks use this Setup as
-ground truth.
-
-\paragraph{Step 2: chain integrity.}
-For every entry $i = 0, 1, 2, \ldots$:
-\begin{itemize}[leftmargin=*]
-  \item the index field equals $i$;
-  \item \texttt{prev\_hash} equals the SHA-256 of entry $i - 1$
-    (or all zeros for $i = 0$);
-  \item there are $\ge t$ distinct signer indices in
-    \texttt{publisher\_sigs}, and every signature verifies under the
-    cohort key at the claimed index;
-  \item the timestamp is $\ge$ the previous entry's timestamp.
-\end{itemize}
-
-\paragraph{Step 3: state-machine.}
-Walk the entries enforcing the regex of \cref{sec:fsm}. Any record
-out of state is rejected.
-
-\paragraph{Step 4: per-record validity.}
-\begin{itemize}[leftmargin=*]
-  \item Every voter pk in a \textsf{VoterRegistration} record must be
-    a valid Ristretto255 group element.
-  \item The \textsf{RingPublication}'s ring must be exactly the
-    multiset of voter pks in the prior \textsf{VoterRegistration}
-    records (no extras, no missing).
-  \item Every \textsf{Ballot}'s choice must appear in the
-    \textsf{ElectionSetup} options.
-  \item Every ballot's TRS signature must verify against the
-    election ID and the ring.
-  \item Ballot timestamps must lie within
-    $[\texttt{voting\_open}, \texttt{voting\_close}]$.
-\end{itemize}
-
-\paragraph{Step 5: witness federation (if declared).}
-\begin{itemize}[leftmargin=*]
-  \item Every checkpoint's signature verifies under the claimed
-    witness key.
-  \item No two checkpoints sign the same index with different
-    head hashes (no \texttt{EQUIVOCATION}).
-  \item At least $k$ distinct witnesses must agree on at least one
-    index.
-\end{itemize}
-
-\paragraph{Step 6: tally.}
-For each ballot $k$ compute the TRS column vector
-$(\sigma_1^{(k)}, \ldots, \sigma_n^{(k)})$ from its signature points
-$A_0^{(k)}, A_1^{(k)}$. Then:
-
-\begin{itemize}[leftmargin=*]
-  \item Two ballots share a signer iff their column vectors collide
-    at some position $j$.
-  \item Group all ballots that share collision positions. Each group
-    corresponds to one voter.
-  \item If a group has one distinct choice, count it once.
-  \item If a group has two or more distinct choices, that voter
-    \emph{double-signed}: reject all of their ballots and emit their
-    pk in the culprit list.
-\end{itemize}
-
-\noindent
-The probability that two ballots by \emph{different} voters
-spuriously share a column is bounded by $\binom{B}{2} \cdot 2^{-252}$
-for $B$ ballots --- cryptographically negligible.
-
-\paragraph{Step 7: tally claim verification.}
-If the log contains a \textsf{TallyPublication}, compare the
-auditor-computed tally to the cohort's claim. A mismatch fails the
-audit. (The CLI exits non-zero, which a script can check.)
-
-\paragraph{Output.}
-An \texttt{AuditReport} object containing the canonical tally,
-the per-ballot accepted/rejected status, the list of double-sign
-culprit pks, and the witness-co-signing status. The CLI prints all
-of this.
-
-% ===========================================================================
-\section{Worked example}
-\label{sec:worked}
-% ===========================================================================
-
-A four-voter election run by three faculty cohort members and two
-witnesses. Concrete file by file.
-
-\paragraph{Setup.} Three Ed25519 keypairs for the cohort
-(Profs.~Adami, Bianchi, Conti), threshold 2-of-3. Two for the
-witnesses (Dean, Ombudsman), threshold 1-of-2 (loose for a small
-demo). Four voters (Alice, Bob, Carol, Dave), each with their own
-Ristretto255 TRS keypair.
-
-\paragraph{Entry 0 (genesis).}
-\begin{lstlisting}[style=json]
-{
-  "index": 0, "prev_hash": "AAAA...", "timestamp": 1716580800,
-  "payload": "<base64 of: {kind: election_setup, election_id: 'a4b2...',
-              title: 'Cafeteria midnight closing', options: ['yes','no'],
-              cohort_pks_b64: [Adami_pk, Bianchi_pk, Conti_pk], threshold: 2,
-              witness_pks_b64: [Dean_pk, Ombuds_pk], witness_threshold: 1,
-              registration_close: ..., voting_open: ..., voting_close: ...}>",
-  "publisher_sigs": [
-    {"i": 0, "sig": "<Adami's sig>"},
-    {"i": 1, "sig": "<Bianchi's sig>"}
-  ]
-}
-\end{lstlisting}
-
-\paragraph{Entries 1--4 (registrations).}
-Each is a \textsf{VoterRegistration} co-signed by two cohort members
-(possibly a different pair per voter --- the subset can rotate).
-
-\paragraph{Entry 5 (ring publication).}
-The four voter pks, sorted by raw bytes, co-signed by two cohort
-members.
-
-\paragraph{Entries 6--9 (ballots).}
-Each voter's TRS-signed ballot. The cohort just adds it to the log
---- the cohort does not verify the TRS signature here, because the
-auditor will. (If they did, they'd reveal that they trusted the
-voter; this way they don't even need to look at the ballot to publish
-it.)
-
-\paragraph{Entry 10 (voting closed).}
-\textsf{VotingClosed} marker, co-signed by two cohort members.
-
-\paragraph{Witness checkpoints.}
-Dean and Ombudsman each independently fetch the log, verify the
-chain, and emit a checkpoint at \texttt{(log\_index=10, head\_hash=H)}
-signed under their own key. Both agree on the same $H$ --- the cohort
-was honest about what the head looks like.
-
-\paragraph{Audit output.}
-\begin{lstlisting}[style=shell]
-$ python3 -m voting.cli audit --log log.jsonl
-
-election:               Cafeteria midnight closing
-election_id:            a4b2...
-cohort:                 2-of-3
-witnesses:              1-of-2; valid checkpoints: 2; latest co-signed idx: 10
-ring size:              4
-accepted ballots:       4
-rejected ballots:       0
-tally:
-  no              1
-  yes             3
-double-sign culprits:   0
-\end{lstlisting}
-
-\paragraph{What if Alice tried to vote twice?}
-She signs two ballots with different choices. Both go on the log.
-At audit time, TRS Trace fires: Alice's column matches in both
-ballots. Both ballots are rejected; Alice's pk is in the culprit list.
-The link from pk to ``Alice the human'' lives in her
-\textsf{VoterRegistration} entry (handle ``alice''), so the cohort can
-follow up; but the cryptography itself is at the pk level.
-
-\paragraph{What if the cohort lies about the tally?}
-They publish a \textsf{TallyPublication} with the wrong numbers.
-The auditor recomputes from the actual ballots, finds the mismatch,
-exits non-zero. The lie is publicly visible.
-
-\paragraph{What if a corrupted majority equivocates?}
-They show ledger A to the Dean and ledger B (with one ballot
-different) to the Ombudsman. Both are validly cohort-signed. The
-Dean signs \texttt{Checkpoint(idx=10, hash=A)}, the Ombudsman signs
-\texttt{Checkpoint(idx=10, hash=B)}. Anyone who collects both
-checkpoints sees the same index with two different hashes: undeniable
-proof. The auditor raises \texttt{AuditError(``EQUIVOCATION'')}.
 
 % ===========================================================================
 \section{The design: deposits, groups and transfers on a chain}
 \label{sec:chain}
 % ===========================================================================
 
-So far the notes have described the federated bulletin board
-(\file{voting/}), which is the \emph{baseline}: one ring for everybody,
-a named cohort that orders entries, and a double vote that is voided
-but costs nothing. This section is about the system the project is
-actually about, in \file{chain/}. It is the design we sketched in
-2021--22, completed:
+\subsection{Why a chain}
 
-\begin{itemize}[leftmargin=*]
-  \item \textbf{A deposit per voter, burned on tracing.} Registering a
-    voter locks eVotes. If the key signs two different messages in a
-    round, the chain names it and burns the deposit.
-  \item \textbf{Groups nobody chooses.} Voters sign inside groups of at
-    least $k$ members, drawn from a block hash that did not exist when
-    registration closed.
-  \item \textbf{Vote or move.} In each round but the last, a voter may
-    instead move its right to a fresh key, which is regrouped in the next
-    round. Doing both is a double-sign.
-  \item \textbf{No one closes the poll.} Every phase change happens at a
-    block timestamp; every node computes the tally.
-\end{itemize}
+Somebody has to keep the record of ballots. If that is the organiser, the
+organiser can drop ballots or show different records to different
+people. A proof-of-work chain lets anybody keep the record: the valid chain
+with the most work wins, and every node checks every rule itself. It also
+has a currency, which is what makes deposits possible.
 
-\begin{intuition}
-The trace tag already tells everybody who signed twice. On a chain
-with money, ``everybody knows'' can become ``it costs you'', with no
-judge: the evidence is two valid signatures anyone can check.
-\end{intuition}
-
-% ---------------------------------------------------------------------------
 \subsection{Blocks and proof of work}
-% ---------------------------------------------------------------------------
 
-A block is a 121-byte header plus a transaction list:
+A block has a header $(\mathit{prev\_hash}, \mathit{height},
+\mathit{difficulty}, \mathit{timestamp}, \mathit{miner}, \mathit{tx\_root},
+\mathit{nonce})$ and a list of transactions. It is valid only if
+SHA-256 of the header starts with $\mathit{difficulty}$ zero bits and
+$\mathit{difficulty}$ is the value the rule prescribes (one bit up or down
+when the median block interval leaves $[30, 90]$ seconds). Nodes follow
+the valid chain with the largest $\sum 2^{\mathit{difficulty}}$
+(\file{chain/node.py}).
 
-\begin{center}\small
-\begin{tabular}{ll}
-\toprule
-Field & Bytes \\
-\midrule
-\texttt{prev\_hash} (SHA-256 of the parent's header) & 32 \\
-\texttt{height} & 8 \\
-\texttt{difficulty} & 1 \\
-\texttt{timestamp} (Unix seconds) & 8 \\
-\texttt{miner\_pk} (Ed25519) & 32 \\
-\texttt{tx\_root} (SHA-256 of the canonical transactions) & 32 \\
-\texttt{nonce} & 8 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-The puzzle: $\mathrm{SHA\text{-}256}(\text{header})$ must start with
-\texttt{difficulty} zero bits, so mining takes $2^d$ tries on average.
-The difficulty moves by one bit when the median interval of the last 11
-blocks leaves $[30, 90]$ seconds, as in the 2021 node. Two rules make
-this a real consensus rule rather than a suggestion:
-
-\begin{itemize}[leftmargin=*]
-  \item a block must carry \emph{exactly} the difficulty the rule
-    prescribes (\texttt{next\_difficulty} in \file{chain/state.py});
-  \item a node adopts another chain only if it validates and has a larger
-    total weight $\sum 2^{d}$ (\texttt{Node.consider}).
-\end{itemize}
-
-\begin{flagbox}
-The 2021 node computed the adjustment in opposite directions when
-mining and when validating, and the 2026 rewrite accepted blocks at any
-difficulty, including zero. A chain whose difficulty is not checked has
-no proof of work at all.
-\end{flagbox}
-
-% ---------------------------------------------------------------------------
 \subsection{Accounts and transactions}
-% ---------------------------------------------------------------------------
 
-Every Ed25519 key has an account $(\mathit{balance}, \mathit{nonce})$; a
-transaction must carry the sender's current nonce. Each block starts
-with a coinbase worth exactly the block reward plus the fees. Six kinds:
+Accounts are Ed25519 keys holding \emph{eVotes}. There are six kinds of
+transaction:
 
-\begin{center}\small
+\begin{center}
+\small
 \begin{tabular}{lll}
 \toprule
-Kind & Signed by & What it does \\
+Kind & Signed by & Effect \\
 \midrule
-\texttt{coinbase}        & ---          & reward + fees to the miner \\
-\texttt{transfer}        & sender       & pays eVotes \\
-\texttt{setup\_poll}     & creator      & opens a poll, fixes its parameters \\
-\texttt{register\_voter} & sponsor      & registers a key; pays fee, locks the deposit \\
-\texttt{ballot}          & \emph{none}  & a TRS-signed choice inside one group \\
-\texttt{key\_transfer}   & \emph{none}  & a TRS-signed move to a fresh key \\
+\texttt{coinbase}        & ---           & reward + fees to the miner \\
+\texttt{transfer}        & sender        & payment \\
+\texttt{setup\_poll}     & creator       & opens a poll \\
+\texttt{register\_voter} & sponsor       & registers a labelled one-time key; fee + deposit \\
+\texttt{ballot}          & one-time key  & a choice, ring-signed in one group \\
+\texttt{key\_transfer}   & one-time key  & moves the vote to a fresh key \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Ballots and transfers have no sender and pay no fee: a sender would be
-an identity. Their validity is the TRS signature inside.
+\noindent
+Ballots and key transfers carry no account, no fee and no Ed25519
+signature, so they do not link a voter to an account.
 
-% ---------------------------------------------------------------------------
 \subsection{Opening a poll and registering voters}
-% ---------------------------------------------------------------------------
+\label{sec:labels}
 
-The creator's \texttt{setup\_poll} fixes the options, the schedule
-($\texttt{registration\_close} \le \texttt{voting\_open} <
-\texttt{voting\_close}$, with \texttt{voting\_open} in the future), the
-group size $k$ (0 means one ring), the number of rounds, and the deposit
-$D$.
+The creator fixes options, a schedule (registration close, voting open,
+voting close), the group size $k$, the number of rounds, the deposit $D$
+and $\lambda$. Before registration closes, a \emph{sponsor} (the voter
+itself, the organiser, an association) registers each voter: it signs the
+transaction, pays the fee and locks $D$.
 
-A \texttt{register\_voter} is signed by a \emph{sponsor}, who pays the fee
-and locks $D$. It contains the voter's TRS public key, a handle, and a
-\emph{proof of possession}: a Schnorr signature by the voter's TRS key
-over \texttt{register-v1 || election\_id || handle}
-(\file{trs/pop.py}). Without it, anyone could register somebody else's
-public key, or a key nobody controls, and use it to pad a group.
+\paragraph{Key labels.} The 2022 design had each voter sign its own
+registration, to prove it held the key. A one-time key cannot do that:
+it would spend its only signature. Instead every key carries a public
+label, and the chain accepts a registration only if
+\[ \mathit{label} = \mathrm{SHA\text{-}256}(\texttt{e-ring-voting/register-v1}
+   \,\|\, \mathit{election\_id} \,\|\, \mathit{len} \,\|\,
+   \mathit{handle}). \]
+The key was made for this poll and this handle, so a registration copied
+from the mempool cannot be filed under another handle or in another poll,
+and a key cannot be registered twice. A label does not prove that anybody
+holds the key; registering a key nobody holds just creates a voter that
+never votes.
 
-\begin{intuition}
-The 2022 procedure already said ``the voter should sign those
-informations with the EC pubkey'' and that the address paying for the
-registration ``could be the same voter or the organisation''. That is
-the proof of possession and the sponsor.
-\end{intuition}
+\begin{lstlisting}[style=shell]
+evote-chain voter-keygen --election-id $EID --handle alice --out alice.json
+evote-chain register-voter ... --sponsor org.json --election-id $EID --voter alice.json
+\end{lstlisting}
 
-% ---------------------------------------------------------------------------
 \subsection{Groups from a beacon}
-% ---------------------------------------------------------------------------
+\label{sec:groups}
 
-Why groups? A signature is $36 + 64n$ bytes and costs $\approx 0.33$\,ms
-per member to verify, so one ring of 1\,000 voters means 64\,kB and a
-third of a second \emph{per ballot}. Groups of $k$ make it $O(k)$.
+One ring for everybody would make every ballot $2\,064 \cdot N$ bytes.
+Instead, the first block past \emph{voting open} splits the registered keys
+into groups of $k$ to $2k - 1$ members. The order is decided by hashing
+each key's fingerprint with the \texttt{prev\_hash} of that block, the
+\emph{beacon}, which did not exist when registration closed. Neither the
+organiser nor a sponsor can therefore place its own keys around a target.
+The miner of the beacon block has some influence: it can throw away a block
+it does not like, at the cost of the block reward (\cref{sec:assessment}).
 
-Who forms them? If the organiser did, it could put a target in a group
-with $k-1$ keys it controls; the target's ballot would then be
-identified by elimination. So nobody does (\file{voting/groups.py}):
-
-\begin{enumerate}[leftmargin=*]
-  \item The first block with timestamp $\ge \texttt{voting\_open}$ freezes
-    the list of registered keys.
-  \item The beacon $\beta$ is that block's \texttt{prev\_hash}.
-  \item Keys are sorted by
-    $\mathrm{SHA\text{-}256}(\texttt{e-ring-voting-groups-v1} \,\|\, I \,\|\, \beta \,\|\, \pk)$.
-  \item The sorted list is cut into $g = \lfloor n/k \rfloor$ groups and the
-    $n \bmod g$ leftovers are added one per group, so every group has
-    between $k$ and $2k-1$ members. Fewer than $2k$ voters: one group.
-\end{enumerate}
-
-Registrations closed before $\beta$ existed, so nobody could pick keys
-that land next to a target. The miner who produces the block whose hash
-becomes $\beta$ could throw away blocks it does not like and mine
-again; every attempt costs a block reward. That residual bias is
-quantified in the paper.
-
-% ---------------------------------------------------------------------------
 \subsection{Rounds: vote or move}
-% ---------------------------------------------------------------------------
 
-The voting window is split into $r$ equal rounds. In round $\rho$, the
-\emph{issue} is the election ID (round 0) or the election ID with
-\texttt{/round} and $\rho$ appended. A key in group $G$ signs, under the
-tag $(I_\rho, G)$, \emph{one} of:
-
+The voting window is split into rounds. In each round, a key spends its one
+use on exactly one of:
 \begin{itemize}[leftmargin=*]
-  \item a ballot: \texttt{ballot-v1 || choice};
-  \item a key transfer: \texttt{key-transfer-v1 || new\_pk}, naming a
-    fresh key that has never appeared in the poll (not in the last
-    round).
+  \item a \textbf{ballot}: \texttt{ballot-v1}$\,\|\,$choice, signed on its
+    group with the round's context;
+  \item a \textbf{key transfer} (not in the last round):
+    \texttt{key-transfer-v1}$\,\|\,\pk'$, naming a fresh key $\pk'$ labelled
+    for the next round. At the end of the round all the new keys are put
+    into new groups with a new beacon.
 \end{itemize}
+A voter who moves hides, in the next round, among \emph{all} members of
+every group the keys of its new group came from: roughly $k$ times as
+many people. A voter who does both has signed twice and is traced.
 
-Because both share the tag, voting \emph{and} moving is two different
-messages: a double-sign. At the first block after the round ends, the
-new keys of all accepted transfers become the members of round
-$\rho+1$ and are grouped again with a fresh beacon.
-
-\begin{intuition}
-A transfer is signed inside your old group, so an observer knows ``one
-of these $k$ people moved'' and nothing more. In the next round your new
-key sits in a group with other movers that came from \emph{other}
-groups. Your ballot now hides among the members of all those origin
-groups, which is at least as many people as before and usually many
-more.
-\end{intuition}
-
-This is the comment above \texttt{encode\_tag} in
-\file{legacy/cryptography/ring.py}: ``the message can be a vote (starts
-with \$) or a transfer (starts with *) to another group with another
-key''.
-
-% ---------------------------------------------------------------------------
 \subsection{Admitting messages: the tag book}
-% ---------------------------------------------------------------------------
 
-Each group keeps a \emph{tag book} (\file{voting/tally.py}): every
-recorded message indexed by its columns $(j, \sigma_j)$. When a ballot or
-transfer arrives and its signature verifies, the book looks for recorded
-messages that share any column with it:
-
-\begin{center}\small
+Each group has a \emph{tag book} (\file{voting/tally.py}) that keeps the
+openings of every recorded signature. A new message that verifies is
+traced against all of them:
+\begin{center}
+\small
 \begin{tabular}{lll}
 \toprule
-Shares a column with & Outcome & In the block? \\
+Outcome & When & Effect \\
 \midrule
-nothing                         & fresh     & yes \\
-one message, different text     & evidence: the signer is exposed & yes \\
-a message with the same text    & replay    & invalid \\
-two messages already            & saturated & invalid \\
+replay & byte-identical to a recorded message & invalid \\
+fresh & traces nobody & recorded \\
+evidence & traces a key not yet exposed & recorded; the key is a culprit \\
+saturated & traces only keys already exposed & invalid \\
+exhausted & would be the $(N{+}1)$-th untraced signature & invalid (cannot happen) \\
 \bottomrule
 \end{tabular}
 \end{center}
+So each key leaves at most two messages on chain, and replays of somebody
+else's ballot cannot get in at all.
 
-So each signer has at most two messages on chain, and nobody can stuff
-the chain with copies of someone else's ballot.
-
-\begin{flagbox}[Issue]
-\textbf{Copies are not double-signs.} A byte-identical copy of a ballot
-has \emph{all} columns equal to the original's. The 2026 rewrite counted
-``all columns equal'' as ``signed twice by the key at position 1'', so
-anyone could copy two honest ballots from the public log, have both
-voided, and get an innocent voter blamed. FS07's rule looks at the
-messages: same message is \emph{linked}, different messages with one
-shared column is a double-sign. \file{trs/trs.py::trace} and the tag
-book follow it; \file{tests/test\_tally.py} has the regression.
-\end{flagbox}
-
-% ---------------------------------------------------------------------------
 \subsection{Close and settlement}
-% ---------------------------------------------------------------------------
 
-At the first block with timestamp $\ge \texttt{voting\_close}$, every
-node, as part of applying that block:
-
-\begin{enumerate}[leftmargin=*]
-  \item classifies every group's tag book: components of messages that
-    share columns are signers; one distinct message $\to$ accepted, two
-    $\to$ void, and the shared column's position names the culprit;
-  \item counts the accepted ballots of every round;
-  \item \emph{burns} the deposits of the round-0 culprits and refunds
-    every other deposit to its sponsor.
-\end{enumerate}
-
+At the first block past \emph{voting close}, every node computes, without
+any transaction asking it to: the tally of all valid ballots of all
+rounds; the culprits (keys used twice, with the handle they were
+registered under); the deposits of round-0 culprits, which are
+\emph{burned}; and the refunds of every other deposit to its sponsor.
 Burned, not paid to the miner: otherwise a miner could register keys,
-double-sign with them and collect the deposits. Keys that arrived by
-transfer have no deposit, so their double-sign is voided but not
-punished; attaching a deposit to them would link them to their origin.
+double-vote with them, and collect.
 
-The audit is the replay: \texttt{python3 -m chain.cli audit} reloads the
-chain from genesis and prints what the chain computed.
-
-% ---------------------------------------------------------------------------
 \subsection{A worked example}
-\label{sec:chain-example}
-% ---------------------------------------------------------------------------
 
-This is the README quickstart. Alice funds the poll; six voters $v_0
-\ldots v_5$; $k = 3$, two rounds, $D = 10$.
-
-\begin{enumerate}[leftmargin=*]
-  \item \textbf{Setup.} Alice's \texttt{setup\_poll} is mined.
-  \item \textbf{Registration.} Alice sponsors six registrations, each with
-    the voter's proof of possession; $6 \times 10 = 60$ eVotes go to
-    escrow.
-  \item \textbf{Freeze.} The first block at \texttt{voting\_open} draws two
-    groups of three from its \texttt{prev\_hash}.
-  \item \textbf{Round 0.} $v_0$ votes yes. $v_1$ transfers to a fresh key
-    $v_1'$. $v_2$ votes yes, then no: the second ballot is admitted as
-    evidence. $v_3$ votes no.
-  \item \textbf{Round 1.} The first block of round 1 forms its groups from
-    the one accepted transfer: a group of one, $\{v_1'\}$. $v_1'$ votes
-    no. Its ballot still hides among the three members of $v_1$'s
-    round-0 group, because nobody knows which of them moved.
-  \item \textbf{Close.} An empty block at \texttt{voting\_close} computes:
-    tally yes 1, no 2 ($v_2$'s ballots are void); culprit $v_2$; 10 burned,
-    50 refunded to Alice.
-\end{enumerate}
-
-% ---------------------------------------------------------------------------
-\subsection{Chain or board?}
-\label{sec:notblockchain}
-% ---------------------------------------------------------------------------
-
-\paragraph{The board (A) wins when} an accountable authority set exists
-(a senate, a board) and seconds-level finality matters. It is the
-Certificate Transparency~\cite{RFC6962} / Sigsum~\cite{Sigsum2024}
-pattern.
-
-\paragraph{The chain (B) wins when} nobody, including the organiser,
-should host the record or form the rings, and misbehaviour should cost
-money without anyone deciding it.
-
-\paragraph{Where B loses.} Finality is probabilistic. Ballots pay no fee,
-so miners have no reason to include them other than the rules. And the
-security budget is economic: an adversary that rents a majority of hash
-power for the voting window can censor or rewrite~\cite{ParkSpecter2021}.
-
-\paragraph{Cost (measured).} With groups of 8, a ballot costs about 7\,ms
-end to end (sign, validate, mine at difficulty 8) whether the poll has 50
-or 200 voters; with one ring it grows from 8\,ms at 10 voters to 38\,ms
-at 50. Full tables in \texttt{paper/artifact.tex}.
+The README runs this poll from the command line in two seconds: six
+voters, groups of three, two rounds, deposit 10. \texttt{v1} moves to a
+fresh key in round 0 and votes from it in round 1; \texttt{v2} votes twice.
+The audit prints:
+\begin{lstlisting}[style=shell]
+poll 136b50a3f69d8247...  phase=closed  registered=6  groups=[[3, 3], [1]]
+  tally: {'no': 2, 'yes': 1}
+  key transfers per round: [1, 0]
+  key used twice in round 0: handle 'v2' (key b47b7ecb9d398b36...)
+  deposits: 10 burned, 50 refunded
+\end{lstlisting}
+\texttt{v2}'s two ballots are both void, its handle is named and its
+sponsor lost 10. The round-1 group has one member, but its ballot hides
+among the three members of the group the transfer came from.
 
 % ===========================================================================
 \section{Codebase map}
 \label{sec:code}
 % ===========================================================================
 
-\begin{table}[h]
-\centering\small
+\begin{center}
+\small
 \begin{tabularx}{\textwidth}{l X}
 \toprule
-File & What's in it / when to read it \\
+File & What is in it \\
 \midrule
-\file{trs/group.py}         & \texttt{Scalar}, \texttt{Point}; Ristretto255 arithmetic. \\
-\file{trs/hash.py}          & RFC 9380 \texttt{expand\_message\_xmd}, \texttt{hash\_to\_group}, \texttt{hash\_to\_scalar}. \\
-\file{trs/trs.py}           & \texttt{keygen}, \texttt{sign}, \texttt{verify}, \texttt{trace} (FS07). Maps line by line to \cref{sec:trace}. \\
-\file{trs/pop.py}           & Schnorr proof of possession for registrations. \\
-\file{trs/serialize.py}     & Canonical byte encodings. \\
-\file{trs/\_libsodium.py}   & cffi binding to libsodium. \\
-\file{voting/records.py}    & Record types, including \texttt{KeyTransfer}; poll parameters. \\
-\file{voting/groups.py}     & Beacon-driven group assignment; per-round issues. \\
-\file{voting/tally.py}      & Tag book: fresh / evidence / replay; classification. \\
+\file{otrs/primitives.py}   & Parameter sets (\texttt{OTRS128}, \texttt{OTRS256}), the oracles $\Gf$ and $\Hf$, seed and signing-stream derivations. \\
+\file{otrs/scheme.py}       & \texttt{PublicKey}, \texttt{SecretKey}, \texttt{keygen}, \texttt{Ring} (\texttt{sign}, \texttt{check}, \texttt{verify}, \texttt{trace}, \texttt{culprits}), encodings. Maps line by line to \cref{sec:otrs-scheme}. \\
+\file{voting/records.py}    & Poll setup, registration, ballot, key transfer; key labels. \\
+\file{voting/groups.py}     & Beacon-driven group assignment; round issues and signing contexts. \\
+\file{voting/tally.py}      & The tag book and classification. \\
 \file{chain/state.py}       & \textbf{The design as consensus rules}: ledger, deposits, lifecycle, groups, rounds, settlement, difficulty. \\
 \file{chain/transactions.py}& The six transaction kinds. \\
 \file{chain/block.py}, \file{mining.py}, \file{node.py} & Header, PoW, miner, fork choice, persistence. \\
-\file{chain/client.py}      & What a voter or sponsor submits. \\
-\file{chain/auditor.py}, \file{cli.py} & Replay-based audit; \texttt{evote-chain}. \\
-\file{voting/log.py}, \file{manager.py}, \file{voter.py}, \file{witness.py}, \file{auditor.py}, \file{cli.py} & The baseline (A). \\
-\file{tests/test\_chain.py} & 33 tests: difficulty, fork choice, ledger, registration, groups, transfers, settlement. \\
-\file{tests/test\_trs.py}   & 39 tests on the primitive and the proof of possession. \\
-\file{tests/test\_groups.py}, \file{test\_tally.py} & Group assignment; classification and the replay regression. \\
+\file{chain/client.py}      & Making labelled keys; building registrations, ballots, transfers. \\
+\file{chain/auditor.py}, \file{cli.py} & Replay-based audit; the \texttt{evote-chain} command. \\
+\file{fs07/}                & The comparison scheme (Ristretto255 via libsodium). \\
+\file{tests/test\_otrs.py}  & The primitive, including the coalition, exculpability and zero-row attacks. \\
+\file{tests/test\_chain.py} & The design end to end. \\
+\file{tests/test\_groups.py}, \file{test\_tally.py} & Groups; classification. \\
+\file{bench/}               & \texttt{bench\_primitives}, \texttt{bench\_groups}, \texttt{bench\_chain}. \\
+\file{legacy/}              & The 2021--22 prototype, unchanged. \\
 \bottomrule
 \end{tabularx}
-\end{table}
+\end{center}
 
 \noindent
-\textbf{Suggested first-pass reading order:} \file{trs/trs.py},
-\file{voting/groups.py}, \file{voting/tally.py}, \file{chain/state.py}.
-Then \file{tests/test\_chain.py}.
+\textbf{Suggested reading order:} \file{otrs/scheme.py},
+\file{tests/test\_otrs.py}, \file{voting/groups.py},
+\file{voting/tally.py}, \file{chain/state.py}, \file{tests/test\_chain.py}.
 
-% ===========================================================================
-\section{Dev environment}
-% ===========================================================================
-
+\paragraph{Dev environment.}
 \begin{lstlisting}[style=shell]
-sudo apt install -y libsodium23 python3-cffi python3-pytest \
-    python3-hypothesis python3-cryptography texlive-latex-recommended
-
-# from repo root
-python3 -m pytest -q                                   # 165 tests, ~1 s
-python3 -m bench.bench_trs --sizes 2,4,8,16,32,64      # primitive
-python3 -m bench.bench_groups --cost --anonymity        # groups
-python3 -m bench.bench_chain --voters 50 --group-size 8 # end to end
-make -C paper                                          # the paper
-make -C docs                                           # these notes
+pip install -e ".[dev]"
+sudo apt install -y libsodium23        # only for fs07/
+python3 -m pytest -q                   # 164 tests, about 2 s
+python3 -m bench.bench_primitives --sizes 2,4,8,16
+python3 -m bench.bench_groups --cost --anonymity
+python3 -m bench.bench_chain --voters 50 --group-size 8
+make -C docs                           # these notes
 \end{lstlisting}
 
+% ===========================================================================
+\section{Why this scheme, and not the prototype's}
+\label{sec:fs07}
+% ===========================================================================
+
+The 2021--22 prototype implemented the Fujisaki--Suzuki scheme
+(FS07)~\cite{FS07}, which works in a group where discrete logarithms are
+hard. A signature there carries $h^{x}$, where $x$ is the signer's secret
+key and $h$ a hash of the tag: the same value in every signature by that
+key under that tag, which is how a double-sign is detected.
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+& FS07 (\file{fs07/}) & SZ21 (\file{otrs/}), $\lambda = 128$ \\
+\midrule
+Assumption & DDH + random oracle & random oracle \\
+Quantum computer & recovers $x$; every past ballot names its signer & none known \\
+Same ballot twice & linked, not exposed & exposed \\
+Public key & 32 B & 6\,177 B \\
+Signature, ring of 8 & 548 B & 16\,517 B \\
+Verify, ring of 8 & 2.6 ms & 1.3 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \noindent
-The README has a complete CLI poll (groups, a transfer, a double-sign)
-that runs in about a second.
+The deciding row is the second. A public chain keeps every ballot forever.
+Validity of the signatures only matters until the poll closes, but secrecy
+of the ballots must last decades. Once someone has a large quantum
+computer, every FS07 ballot ever written to the chain can be opened; the
+one-time scheme gives that computer nothing better than guessing seeds.
+The price is size: 30 times larger signatures, which groups of 8 to 16
+keep at 16 to 33~kB per ballot.
+
+\paragraph{The prototype's bugs.} Its hash into the group returned
+$g^{t}$ with $t$ computable from public data, so anyone could compute $h^{x_j}
+= \pk_j^{\,t}$ for every member and find the signer: no anonymity at all.
+And it inverted the ring position modulo the wrong number, so only position
+1 produced verifying signatures. Both passed a demo. The fixed FS07 is kept
+in \file{fs07/} for the comparison.
 
 % ===========================================================================
 \section{Open problems --- where you would contribute}
 \label{sec:open}
 % ===========================================================================
 
-The first four are specific to the design; the rest are general.
-
 \begin{enumerate}[leftmargin=*]
   \item\label{itm:slash} \textbf{Slashing transferred keys.} A key that
-    arrived by transfer has no deposit, so its double-sign costs nothing.
-    Can a deposit travel with the transfer (a blinded or
-    zero-knowledge commitment) without linking the new key to the old?
-
-  \item\label{itm:beacon} \textbf{An unbiasable beacon.} Replace
-    \texttt{prev\_hash} with a VDF output or a commit--reveal among
-    sponsors, and measure what it costs.
-
-  \item\label{itm:pricing} \textbf{Pricing.} How large must fees and
-    deposits be for a given $k$ and adversary budget? How should miners be
-    paid for including fee-less ballots (e.g.\ from the setup fee)?
-
-  \item\label{itm:leak} \textbf{Per-group tallies leak.} A group that
-    votes unanimously reveals every member's vote. Tally across groups
-    without publishing per-group counts.
-
-  \item\label{itm:tamarin} \textbf{Tamarin / ProVerif model} of
+    arrived by transfer has no deposit. Can a deposit travel with the
+    transfer without linking the new key to the old?
+  \item\label{itm:beacon} \textbf{An unbiasable beacon}: a VDF or a
+    commit--reveal among sponsors instead of \texttt{prev\_hash}.
+  \item\label{itm:pricing} \textbf{Pricing.} Deposits and fees for a given
+    $k$ and adversary budget; paying miners to include fee-less ballots.
+  \item\label{itm:leak} \textbf{Per-group tallies leak.} Tally across
+    groups without publishing per-group counts.
+  \item\label{itm:short} \textbf{Shorter signatures.} A hash-based
+    one-time traceable scheme sub-linear in $N$ would allow larger groups.
+  \item\label{itm:qrom} \textbf{A proof in the quantum random-oracle
+    model} for~\cite{SZ21}.
+  \item\label{itm:formal} \textbf{Tamarin / ProVerif model} of
     registration, groups, rounds and settlement.
-
-  \item\label{itm:logsize} \textbf{Sub-linear traceable signatures.}
-    Fujisaki~\cite{Fujisaki2011} has one; an implementation would allow
-    larger $k$ for the same cost.
-
   \item\label{itm:receipt} \textbf{Receipt-freeness.} A voter who reveals
-    $x_i$ lets a coercer recompute $\sigma_i = h^{x_i}$ and find the
-    ballot. JCJ~\cite{JCJ2005} / Civitas~\cite{Civitas2008}-style
-    machinery is needed, and the trace tag is exactly what it must hide.
-
-  \item\label{itm:easycrypt} \textbf{EasyCrypt proofs} of the FS07
-    theorems~\cite{FS07}, linked to the implementation.
-
-  \item\label{itm:pq} \textbf{Post-quantum.} Scafuro and
-    Zhang~\cite{ScafuroZhang2021} give a hash-based one-time traceable
-    ring signature; swapping it in would make the design post-quantum at a
-    cost in size.
-
-  \item\label{itm:net} \textbf{A network layer} for the chain (gossip,
-    mempool); FROST~\cite{FROST2020} and gossip for the baseline.
+    its master secret lets a coercer recognise its ballot.
+    JCJ~\cite{JCJ2005}-style machinery would be needed.
+  \item\label{itm:net} \textbf{A network layer} for the chain.
 \end{enumerate}
 
 % ===========================================================================
@@ -1522,51 +748,46 @@ The first four are specific to the design; the rest are general.
 \subsection{The precise anonymity claim}
 
 \textbf{What we provide.} Given the chain and one ballot signed in group
-$G$: no efficient adversary can tell which member of $G$ produced it
-with probability noticeably better than $1/|G|$, under DDH in
-Ristretto255 in the random-oracle model~\cite{FS07}. A ballot cast after
-a transfer hides among the members of every origin group of its new
-group.
-
-\textbf{Where this breaks down.}
+$g$ by a key used once: no efficient adversary can tell which member of $g$
+produced it noticeably better than guessing, in the random-oracle
+model~\cite{SZ21}. A ballot cast after a transfer hides among the members
+of every origin group of its new group.
 
 \begin{flaw}[The anonymity set is the honest part of the group]
 Sybil keys look honest. With half the keys adversarial and $k = 4$, one
 honest voter in eight has no honest peer; with $k = 8$, about one in 130.
-Choose $k$ against the sybil share you expect, not against the number of
-voters.
+Choose $k$ against the sybil share you expect.
 \end{flaw}
 
 \begin{flaw}[Per-group tallies are public]
-Ballots name their group. A unanimous group reveals everyone in it.
+A unanimous group reveals everyone in it.
 \end{flaw}
 
 \begin{flaw}[Beacon bias]
-The miner of the beacon block can discard blocks to re-draw groups, at a
+The miner of the beacon block can discard blocks to redraw groups, at a
 block reward each.
 \end{flaw}
 
-\begin{flaw}[No receipt-freeness]
-Revealing $x_i$ proves the vote; see open problem~\ref{itm:receipt}.
+\begin{flaw}[One use, really]
+Anonymity holds only for a key that signs once. The chain makes a second
+use impossible to hide, and our signer is deterministic, but a wallet that
+reuses a key elsewhere destroys its own anonymity.
 \end{flaw}
 
 \begin{flaw}[Network and device]
-Submitting a ballot reveals IP and timing (use Tor or a relay); malware
-with $\sk$ signs anything.
+Submitting a ballot reveals IP and timing; malware with the key signs
+anything.
 \end{flaw}
 
 \subsection{The precise verifiability and accountability claims}
 
 \textbf{What we provide.} Anyone replaying the chain obtains the same
-groups, the same tally, the same culprits and the same settlement;
-nobody publishes a result that could differ from it. A key named as a
-culprit signed two different messages in one round, unless its secret
-leaked (FS07 exculpability); copies of honest ballots never name anyone.
-
-\textbf{Where this breaks down.}
+groups, tally, culprits and settlement; nobody publishes a result that
+could differ from it. A culprit's key really signed twice, unless its
+secret leaked.
 
 \begin{flaw}[Transferred keys are not punished]
-Their double-sign voids their messages; there is no deposit to burn.
+A second use voids their messages; there is no deposit to burn.
 \end{flaw}
 
 \begin{flaw}[Censorship]
@@ -1574,14 +795,9 @@ Ballots pay no fee; a censoring majority of hash power can keep them out
 until the round ends.
 \end{flaw}
 
-\begin{flaw}[Economic security]
-The chain is as safe as the hash power behind it~\cite{ParkSpecter2021}.
-\end{flaw}
-
 \begin{flaw}[Eligibility is the sponsor's word]
-The chain checks proof of possession, not personhood. Sponsors are
-accountable on chain (their deposits burn if their voters cheat), but
-nothing stops a sponsor from registering keys for people who do not
+The chain checks labels, not personhood. Sponsors are accountable on chain,
+but nothing stops a sponsor from registering keys for people who do not
 exist.
 \end{flaw}
 
@@ -1589,12 +805,14 @@ exist.
 
 \begin{quote}
 \itshape
-v0.5 makes double-voting cost money without a judge: a traceable ring
-signature names the key, the chain burns its deposit. It forms voter
-groups from a beacon nobody controls at registration time, and lets
-voters widen their anonymity by moving between groups. It does not
-provide coercion resistance, punish transferred keys, or remove miner
-bias from the beacon.
+v1.0 makes double-voting cost money without a judge: a one-time traceable
+ring signature names any key used twice, and the chain burns its deposit.
+The signature needs nothing but a hash function, so ballots stay secret
+even against a future quantum computer. Voter groups come from a beacon
+nobody controls at registration time, and voters can widen their anonymity
+by moving between groups. It does not provide coercion resistance, punish
+transferred keys, or remove miner bias from the beacon, and its signatures
+are large.
 \end{quote}
 
 % ===========================================================================
@@ -1604,82 +822,62 @@ bias from the beacon.
 
 \begin{description}[leftmargin=*,style=nextline]
   \item[anonymity set]
-    The keys a ballot could have come from: its group, or for a ballot
-    after a transfer, all origin groups of its new group.
-  \item[audit]
-    Replaying the chain (B) or the bulletin board (A) and recomputing
-    everything.
-  \item[ballot]
-    A choice plus a TRS signature under the tag (round issue, group).
+    The keys a ballot could have come from.
   \item[beacon]
     The \texttt{prev\_hash} of the block that freezes a round; it decides
     the groups.
-  \item[bulletin board]
-    The baseline's append-only JSON-Lines log.
-  \item[checkpoint]
-    A witness's signed statement ``at index $i$ the head is $h$'' (A).
-  \item[cohort]
-    The baseline's $N$ publishers; any $t$ co-sign an entry (A).
+  \item[commitment]
+    A sealed value: binding and hiding. Here Naor's bit commitment.
+  \item[culprit]
+    A key that signed twice in a round; named with its registration
+    handle.
   \item[deposit]
-    eVotes locked per registered voter; burned if the key double-signs in
-    round 0, refunded to the sponsor otherwise.
-  \item[discrete logarithm]
-    ``Given $g$ and $g^x$, find $x$''. Assumed hard in Ristretto255.
-  \item[double-sign]
-    Two different messages by one key under one tag. Exposes the key.
-  \item[election ID]
-    32 bytes identifying a poll; the round-0 issue.
-  \item[equivocation]
-    A publisher showing different logs to different people (A).
-  \item[Fiat--Shamir]
-    Replacing a verifier's random challenge by a hash of the transcript.
+    eVotes locked per registered voter; burned if the key is a round-0
+    culprit, refunded to the sponsor otherwise.
+  \item[equivocal mode]
+    A Naor commitment key built from two seeds, which lets its maker open
+    a commitment either way.
+  \item[fingerprint]
+    SHA-256 of an encoded public key; how the chain names keys.
   \item[group]
-    (1) A set of $k$..$2k-1$ voters signing as one ring. (2) The algebraic
-    structure Ristretto255 is.
-  \item[hash-to-curve]
-    Mapping bytes to a group element with no known discrete log
-    (RFC~9380).
-  \item[issue]
-    The first half of a TRS tag: election ID, plus \texttt{/round} and the
-    round number after round 0.
+    A set of $k$..$2k-1$ keys that sign as one ring.
+  \item[key label]
+    32 public bytes in a key that name its single use.
   \item[key transfer]
-    A TRS-signed message moving a voter's right to a fresh key for the
+    A ring-signed message moving a voter's right to a fresh key for the
     next round.
-  \item[linked]
-    Trace outcome for two signatures by one key on the same message: a
-    copy, counted once, nobody blamed.
-  \item[proof of possession]
-    A Schnorr signature showing the registrant knows the secret key.
+  \item[$\lambda$]
+    The security parameter, 128 or 256.
+  \item[one-time]
+    Each key signs at most once.
+  \item[opening]
+    The seed revealed for a commitment.
+  \item[random oracle]
+    An idealised hash function returning fresh random bits for each new
+    input.
   \item[round]
-    A slice of the voting window with its own issue and groups.
+    A slice of the voting window with its own context and groups.
+  \item[row]
+    One of the $\lambda$ Naor strings of a public key.
   \item[sponsor]
     The account that pays a voter's registration fee and deposit.
-  \item[tag]
-    The pair (issue, ring); traceability is per tag.
   \item[tag book]
-    Per-group index of messages by column; decides fresh / evidence /
-    replay.
-  \item[trace tag]
-    $\sigma_i = h^{x_i}$, the same in every signature by key $i$ under a
-    tag.
-  \item[TRS]
-    Traceable ring signature, here Fujisaki--Suzuki 2007.
-  \item[witness]
-    An independent party co-signing the board's head (A).
+    Per-group record of signatures and their openings; decides replay,
+    fresh, evidence, saturated.
+  \item[target]
+    $z = \Hf(\ldots)$, the value every signature's shares must XOR to.
+  \item[trace]
+    Finding a row whose two seeds appear in two signatures.
 \end{description}
 
 \begin{thebibliography}{99}\small
+\bibitem{SZ21} A.~Scafuro and B.~Zhang. One-time Traceable Ring Signatures. ESORICS, 2021. IACR ePrint 2021/1054.
 \bibitem{FS07} E.~Fujisaki and K.~Suzuki. Traceable Ring Signature. PKC, 2007.
-\bibitem{Fujisaki2011} E.~Fujisaki. Sub-linear Size Traceable Ring Signatures without Random Oracles. CT-RSA, 2011.
-\bibitem{ScafuroZhang2021} A.~Scafuro and B.~Zhang. One-time Traceable Ring Signatures. ESORICS, 2021.
-\bibitem{RFC9380} A.~Faz-Hern\'andez, S.~Scott, N.~Sullivan, R.~Wahby, C.~Wood. Hashing to Elliptic Curves. RFC~9380, 2023.
-\bibitem{FROST2020} C.~Komlo, I.~Goldberg. FROST: Flexible Round-Optimized Schnorr Threshold Signatures. SAC, 2020.
-\bibitem{RFC6962} B.~Laurie, A.~Langley, E.~K\"asper. Certificate Transparency. RFC~6962, 2013.
-\bibitem{Sigsum2024} Sigsum: Signed and verifiable software transparency. \url{https://www.sigsum.org}.
-\bibitem{GK15} J.~Groth and M.~Kohlweiss. One-Out-of-Many Proofs. EUROCRYPT, 2015.
+\bibitem{Naor91} M.~Naor. Bit Commitment Using Pseudorandomness. Journal of Cryptology, 1991.
+\bibitem{RST01} R.~Rivest, A.~Shamir, Y.~Tauman. How to Leak a Secret. ASIACRYPT, 2001.
+\bibitem{LWW04} J.~K.~Liu, V.~K.~Wei, D.~S.~Wong. Linkable Spontaneous Anonymous Group Signature for Ad Hoc Groups. ACISP, 2004.
+\bibitem{Wagner02} D.~Wagner. A Generalized Birthday Problem. CRYPTO, 2002.
 \bibitem{JCJ2005} A.~Juels, D.~Catalano, M.~Jakobsson. Coercion-resistant electronic elections. WPES, 2005.
-\bibitem{Civitas2008} M.~Clarkson, S.~Chong, A.~Myers. Civitas. IEEE S\&P, 2008.
-\bibitem{ParkSpecter2021} S.~Park, M.~Specter, N.~Narula, R.~L.~Rivest. Going from bad to worse: from Internet voting to blockchain voting. Journal of Cybersecurity, 2021.
 \end{thebibliography}
 
 \end{document}

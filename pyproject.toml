@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "e-ring-voting"
-version = "0.5.0"
-description = "Anonymous voting on a proof-of-work chain where double-voting costs a deposit: Fujisaki-Suzuki traceable ring signatures, beacon-assigned groups and key transfers."
+version = "1.0.0"
+description = "Anonymous voting on a proof-of-work chain where double-voting costs a deposit: Scafuro-Zhang one-time traceable ring signatures (hash-only), beacon-assigned groups and key transfers."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,7 +13,7 @@ authors = [
     { name = "Daniele Lin" },
     { name = "Niccolò Pagano" },
 ]
-keywords = ["cryptography", "ring-signature", "traceable", "e-voting", "blockchain", "ristretto255"]
+keywords = ["cryptography", "ring-signature", "one-time", "traceable", "post-quantum", "e-voting", "blockchain"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -22,24 +22,23 @@ classifiers = [
     "Topic :: Security :: Cryptography",
 ]
 dependencies = [
-    # We bind libsodium's Ristretto255 surface directly via cffi (ABI mode)
-    # because PyNaCl 1.5.0 does not export ristretto255 bindings on systems
-    # where libsodium was missing them at build time.
-    "cffi>=1.15",
-    # Ed25519 for account and cohort signatures.
+    # Ed25519 for account signatures (sponsors, poll creators, payments).
+    # The ring signature itself (otrs/) needs only hashlib.
     "cryptography>=41",
 ]
 
 [project.optional-dependencies]
+# The FS07 comparison scheme binds libsodium's Ristretto255 via cffi.
+fs07 = ["cffi>=1.15"]
 dev = [
+    "cffi>=1.15",
     "pytest>=7.0",
     "hypothesis>=6.0",
-    "pytest-benchmark>=4.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["trs*", "voting*", "chain*"]
+include = ["otrs*", "fs07*", "voting*", "chain*"]
 exclude = ["legacy*", "tests*", "bench*"]
 
 [tool.pytest.ini_options]

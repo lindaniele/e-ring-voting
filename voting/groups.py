@@ -1,8 +1,9 @@
 """
 Fixed-size voter groups and round tags.
 
-A traceable ring signature costs O(n) in time and size, so a single ring
-of every voter does not scale. The original e-ring-voting procedure fixed a
+A one-time traceable ring signature costs O(n) in time and size (about
+2 KB per member at λ = 128), so a single ring of every voter does not
+scale: a ring of 1000 makes every ballot 2 MB. The original e-ring-voting procedure fixed a
 *group size* in the poll announcement and let voters sign inside their
 group. That raises the question this module answers: **who decides which
 voters share a group?** If the organiser did, it could surround a target
@@ -30,22 +31,28 @@ GROUP_DST = b"e-ring-voting-groups-v1"
 
 
 def issue_for(election_id: str, round_: int) -> bytes:
-    """The TRS ``issue`` of a round: the election id, suffixed after round 0."""
+    """The tag of a round: the election id, suffixed after round 0."""
     eid = bytes.fromhex(election_id)
     if round_ == 0:
         return eid
     return eid + b"/round" + round_.to_bytes(4, "big")
 
 
+def signing_context(election_id: str, round_: int) -> bytes:
+    """The OTRS context string of a round, hashed into every signature."""
+    return b"e-ring-voting/v1/" + issue_for(election_id, round_)
+
+
 def assign_groups(
     members: Sequence[bytes], group_size: int, beacon: bytes, label: bytes
 ) -> List[List[bytes]]:
     """
-    Partition ``members`` (raw public keys) into groups.
+    Partition ``members`` (key identifiers: the chain passes OTRS key
+    fingerprints) into groups.
 
     ``label`` binds the assignment to one poll and round (use
-    :func:`issue_for`). Each returned group is sorted by key bytes, which is
-    the canonical ring order. ``group_size == 0`` yields a single group.
+    :func:`issue_for`). Each returned group is sorted by identifier, which
+    is the canonical ring order. ``group_size == 0`` yields a single group.
     """
     if len(set(members)) != len(members):
         raise ValueError("duplicate members")

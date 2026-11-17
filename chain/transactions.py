@@ -12,7 +12,7 @@ kind                        signed by    purpose
 ``transfer``                sender       eVote payment between accounts
 ``setup_poll``              poll creator open a new poll (wraps ElectionSetup)
 ``register_voter``          sponsor      register a voter key, lock its deposit
-``ballot``                  — (none)     submit a TRS-signed ballot
+``ballot``                  — (none)     submit a ring-signed ballot
 ``key_transfer``            — (none)     move a voting right to the next round
 ==========================  ===========  ======================================
 
@@ -27,15 +27,15 @@ voter anonymity at the chain layer: they are indistinguishable in metadata
 across the members of a group.
 
 The trade-off is that they are not priced; spam is bounded instead by the
-TRS rules: only group members can produce a valid signature, a copy of a
-recorded message is invalid, and a signer gets at most two messages per
-tag on chain (the second one exposes them).
+ring-signature rules: only group members can produce a valid signature, a
+copy of a recorded signature is invalid, and each key gets at most two
+signatures on chain (the second one exposes it and costs its deposit).
 
 Canonical encoding: JSON with ``sort_keys=True`` and
 ``separators=(",", ":")`` over a top-level ``{"kind": ..., "body": ...}``
 object. Binary blobs are base64-standard-encoded. This matches the
-``voting/records.py`` convention so the wrapped voting records remain
-byte-identical to their bulletin-board form.
+``voting/records.py`` convention, so a wrapped voting record has one
+canonical byte string.
 """
 
 from __future__ import annotations
@@ -255,7 +255,7 @@ def make_ballot(election_id: str, ballot_payload: bytes) -> Transaction:
     """
     Anonymous ballot. No Ed25519 signature, no sender, no fee, no nonce.
 
-    Validity is checked by the state machine: the TRS signature inside
+    Validity is checked by the state machine: the ring signature inside
     ``ballot_payload`` must verify against the ballot's group for this
     election and round, and the choice must be in the option set.
     """

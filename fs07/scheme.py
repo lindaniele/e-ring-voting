@@ -30,9 +30,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence
 
-from trs.group import ORDER, Point, Scalar, base_mul
-from trs.hash import hash_to_group, hash_to_scalar
-from trs.serialize import (
+from fs07.group import ORDER, Point, Scalar, base_mul
+from fs07.hash import hash_to_group, hash_to_scalar
+from fs07.serialize import (
     decode_signature,
     encode_points,
     encode_ring,

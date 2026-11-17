@@ -12,7 +12,14 @@ from cryptography.hazmat.primitives import serialization
 
 from chain.auditor import audit_chain
 from chain.block import BlockHeader, leading_zero_bits, verify_pow
-from chain.client import ballot_tx, key_transfer_tx, locate, registration_tx
+from chain.client import (
+    ballot_tx,
+    key_transfer_tx,
+    locate,
+    registration_tx,
+    transfer_key,
+    voter_key,
+)
 from chain.mining import mine_block, next_difficulty
 from chain.node import Node, make_genesis_node
 from chain.state import ChainParams, StateError, state_for_next_block
@@ -28,8 +35,8 @@ from chain.transactions import (
     sign_tx,
     verify_tx_sig,
 )
-from trs import keygen, prove_possession
-from voting.records import Ballot, ElectionSetup, VoterRegistration
+from otrs import keygen
+from voting.records import Ballot, ElectionSetup, KeyTransfer, VoterRegistration
 
 
 # Tests pin difficulty very low (a few bits) so mining is sub-second.
@@ -338,7 +345,7 @@ class Election:
     """A poll on a fresh chain; the sponsor (= creator) and the miner differ."""
 
     def __init__(self, *, voters=4, group_size=0, rounds=1, deposit=10,
-                 options=("yes", "no")):
+                 options=("yes", "no"), security=128):
         self.miner, _ = new_account()
         self.creator, self.creator_sk = new_account()
         self.creator_b64 = b64encode(self.creator).decode()
@@ -351,8 +358,7 @@ class Election:
             election_id=hashlib.sha256(self.creator).hexdigest(),
             title="Demo", description="", options=list(options),
             registration_close=REG_CLOSE, voting_open=OPEN, voting_close=CLOSE,
-            cohort_pks_b64=[self.creator_b64], threshold=1,
-            group_size=group_size, rounds=rounds, deposit=deposit,
+            group_size=group_size, rounds=rounds, deposit=deposit, security=security,
         )
         self.eid = self.setup.election_id
         tx = make_setup_poll(
@@ -360,14 +366,20 @@ class Election:
             nonce=self.node.state.nonce(self.creator_b64), sk=self.creator_sk,
         )
         mine_tx(self.node, self.miner, tx, fee=TEST_PARAMS.setup_fee, ts=T0 + 1)
-        self.voters = [keygen() for _ in range(voters)]
+        self.voters = [self.key(f"v{i}") for i in range(voters)]
         for i, kp in enumerate(self.voters):
             self.register(kp, f"v{i}")
+
+    def key(self, handle):
+        return voter_key(self.eid, handle, security=self.setup.security)
+
+    def new_key(self, round_=1):
+        return transfer_key(self.eid, round_, security=self.setup.security)
 
     def register(self, kp, handle):
         tx = registration_tx(
             sponsor_pk_raw=self.creator, sponsor_sk=self.creator_sk,
-            election_id=self.eid, voter=kp, handle=handle,
+            election_id=self.eid, voter_pk=kp.pk, handle=handle,
             fee=TEST_PARAMS.registration_fee, deposit=self.setup.deposit,
             nonce=self.node.state.nonce(self.creator_b64),
         )
@@ -381,8 +393,8 @@ class Election:
         """The poll as the transactions of a block at ``ts`` will see it."""
         return state_for_next_block(self.node.state, ts).polls[self.eid]
 
-    def vote(self, kp, choice, ts):
-        mine_tx(self.node, self.miner, ballot_tx(self.poll_at(ts), kp, choice), ts=ts)
+    def vote(self, kp, choice, ts, **kw):
+        mine_tx(self.node, self.miner, ballot_tx(self.poll_at(ts), kp, choice, **kw), ts=ts)
 
     def transfer(self, kp, new_kp, ts):
         mine_tx(self.node, self.miner, key_transfer_tx(self.poll_at(ts), kp, new_kp.pk), ts=ts)
@@ -395,8 +407,8 @@ class Election:
         return self.node.state.balance(self.creator_b64)
 
 
-def b64pk(kp) -> str:
-    return b64encode(kp.pk.point.raw).decode()
+def fp(kp) -> str:
+    return kp.pk.fingerprint.hex()
 
 
 class TestSingleRing:
@@ -428,7 +440,8 @@ class TestSingleRing:
         e.vote(e.voters[2], "c", OPEN + 4)
         result = e.close()
         assert result.tally == {"a": 1, "b": 0, "c": 1}
-        assert result.culprits == [(0, b64pk(cheater))]
+        # The trace names the key, and the key names its registration.
+        assert result.culprits == [(0, fp(cheater), "v0")]
         assert result.slashed == 10 and e.node.state.burned == 10
         assert result.refunded == 30
         # Burned, not paid out: the sponsor gets back three deposits of four.
@@ -439,11 +452,24 @@ class TestSingleRing:
         tx = ballot_tx(e.poll_at(OPEN), e.voters[0], "yes")
         mine_tx(e.node, e.miner, tx, ts=OPEN)
         with pytest.raises(StateError, match="replay"):
-            mine_tx(e.node, e.miner, tx, ts=OPEN + 1)
+            mine_tx(e.node, e.miner, tx, ts=OPEN + 1)   # a copy, by anybody
         with pytest.raises(StateError, match="replay"):
-            e.vote(e.voters[0], "yes", OPEN + 1)  # fresh signature, same message
+            e.vote(e.voters[0], "yes", OPEN + 1)       # re-sent: deterministic
         e.vote(e.voters[1], "no", OPEN + 1)
-        assert e.close().tally == {"yes": 1, "no": 1}
+        result = e.close()
+        assert result.tally == {"yes": 1, "no": 1}
+        assert result.culprits == [] and result.slashed == 0
+
+    def test_same_ballot_signed_twice_with_fresh_randomness_is_traced(self):
+        # FS07 would only link these two; a one-time key is exposed.
+        e = Election(voters=3, deposit=10)
+        e.vote(e.voters[0], "yes", OPEN, randomized=True)
+        e.vote(e.voters[0], "yes", OPEN + 1, randomized=True)
+        e.vote(e.voters[1], "no", OPEN + 2)
+        result = e.close()
+        assert result.tally == {"yes": 0, "no": 1}
+        assert result.culprits == [(0, fp(e.voters[0]), "v0")]
+        assert result.slashed == 10
 
     def test_poll_with_one_registrant_aborts_and_refunds(self):
         e = Election(voters=1, deposit=10)
@@ -460,51 +486,64 @@ class TestSingleRing:
 
 
 class TestRegistration:
-    def _tx(self, e, voter, pop_record):
+    def _tx(self, e, record):
         from chain.transactions import make_register_voter
         return make_register_voter(
-            e.creator, e.eid, pop_record.to_payload(), fee=1,
+            e.creator, e.eid, record.to_payload(), fee=1,
             deposit=e.setup.deposit, nonce=e.node.state.nonce(e.creator_b64),
             sk=e.creator_sk,
         )
 
-    def test_proof_of_possession_required(self):
+    def _record(self, kp, handle):
+        return VoterRegistration(
+            voter_pk_b64=b64encode(kp.pk.to_bytes()).decode(), voter_handle=handle,
+        )
+
+    def test_key_must_be_made_for_this_poll_and_handle(self):
         e = Election(voters=0)
-        victim, attacker = keygen(), keygen()
-        # A sponsor cannot register a key whose secret it does not hold.
-        forged = prove_possession(
-            attacker.sk, victim.pk, VoterRegistration.pop_context(e.eid, "x")
-        )
-        record = VoterRegistration(
-            voter_pk_b64=b64pk(victim), voter_handle="x",
-            pop_sig_b64=b64encode(forged).decode(),
-        )
-        with pytest.raises(StateError, match="proof of possession"):
-            mine_tx(e.node, e.miner, self._tx(e, victim, record), fee=1)
-        # Nor replay a proof made for another handle.
-        other = prove_possession(
-            victim.sk, victim.pk, VoterRegistration.pop_context(e.eid, "y")
-        )
-        record = VoterRegistration(
-            voter_pk_b64=b64pk(victim), voter_handle="x",
-            pop_sig_b64=b64encode(other).decode(),
-        )
-        with pytest.raises(StateError, match="proof of possession"):
-            mine_tx(e.node, e.miner, self._tx(e, victim, record), fee=1)
+        # A key made for handle "y" cannot be registered as "x" ...
+        with pytest.raises(StateError, match="not made for this poll"):
+            mine_tx(e.node, e.miner, self._tx(e, self._record(e.key("y"), "x")), fee=1)
+        # ... nor a key made for another poll, nor an unlabelled key.
+        other = voter_key("cd" * 32, "x")
+        with pytest.raises(StateError, match="not made for this poll"):
+            mine_tx(e.node, e.miner, self._tx(e, self._record(other, "x")), fee=1)
+        with pytest.raises(StateError, match="not made for this poll"):
+            mine_tx(e.node, e.miner, self._tx(e, self._record(keygen(), "x")), fee=1)
+        mine_tx(e.node, e.miner, self._tx(e, self._record(e.key("x"), "x")), fee=1)
+
+    def test_key_must_use_the_poll_security_parameter(self):
+        e = Election(voters=0)
+        big = voter_key(e.eid, "x", security=256)
+        with pytest.raises(StateError, match="λ = 128"):
+            mine_tx(e.node, e.miner, self._tx(e, self._record(big, "x")), fee=1)
+
+    def test_malformed_key_rejected(self):
+        e = Election(voters=0)
+        record = VoterRegistration(voter_pk_b64=b64encode(b"\x01" * 40).decode(),
+                                   voter_handle="x")
+        with pytest.raises(StateError, match="invalid OTRS public key"):
+            mine_tx(e.node, e.miner, self._tx(e, record), fee=1)
 
     def test_deposit_must_match_the_poll(self):
         e = Election(voters=0, deposit=10)
         with pytest.raises(StateError, match="deposit"):
             mine_tx(e.node, e.miner, registration_tx(
                 sponsor_pk_raw=e.creator, sponsor_sk=e.creator_sk,
-                election_id=e.eid, voter=keygen(), handle="v", fee=1, deposit=0,
-                nonce=e.node.state.nonce(e.creator_b64),
+                election_id=e.eid, voter_pk=e.key("v").pk, handle="v", fee=1,
+                deposit=0, nonce=e.node.state.nonce(e.creator_b64),
             ), fee=1)
 
     def test_same_key_twice_rejected(self):
         e = Election(voters=2)
         with pytest.raises(StateError, match="already registered"):
-            e.register(e.voters[0], "again")
+            e.register(e.voters[0], "v0")
+
+    def test_lambda_256_poll(self):
+        e = Election(voters=3, security=256)
+        for i, kp in enumerate(e.voters):
+            e.vote(kp, "yes" if i else "no", OPEN + i)
+        assert e.close().tally == {"yes": 2, "no": 1}
 
 
 class TestGroups:
@@ -513,8 +552,8 @@ class TestGroups:
         poll = e.poll_at(OPEN)
         sizes = sorted(len(g) for g in poll.rounds[0].groups)
         assert sizes == [3, 3, 4]
-        members = [pk.point.raw for g in poll.rounds[0].groups for pk in g]
-        assert sorted(members) == sorted(kp.pk.point.raw for kp in e.voters)
+        members = [pk.fingerprint for g in poll.rounds[0].groups for pk in g.keys]
+        assert sorted(members) == sorted(kp.pk.fingerprint for kp in e.voters)
 
     def test_ballots_are_signed_per_group_and_tallied_together(self):
         e = Election(voters=10, group_size=3)
@@ -532,7 +571,7 @@ class TestGroups:
         record = Ballot.from_obj(__import__("json").loads(b64decode(tx.body["payload_b64"])))
         _, mine = locate(poll, e.voters[0].pk)
         other = (mine + 1) % len(poll.rounds[0].groups)
-        moved = Ballot(choice="yes", trs_sig_b64=record.trs_sig_b64, round=0, group=other)
+        moved = Ballot(choice="yes", sig_b64=record.sig_b64, round=0, group=other)
         with pytest.raises(StateError, match="does not verify"):
             mine_tx(e.node, e.miner, make_ballot(e.eid, moved.to_payload()), ts=OPEN)
 
@@ -540,15 +579,15 @@ class TestGroups:
 class TestKeyTransfer:
     def test_transfer_moves_the_vote_to_the_next_round(self):
         e = Election(voters=6, group_size=3, rounds=2)
-        new0, new1 = keygen(), keygen()
+        new0, new1 = e.new_key(), e.new_key()
         e.transfer(e.voters[0], new0, OPEN)
         e.transfer(e.voters[1], new1, OPEN + 1)
         e.vote(e.voters[2], "yes", OPEN + 2)
         round1 = T0 + 300
         poll = e.poll_at(round1)
         assert poll.current_round == 1
-        assert sorted(pk.point.raw for g in poll.rounds[1].groups for pk in g) == sorted(
-            [new0.pk.point.raw, new1.pk.point.raw]
+        assert sorted(pk.fingerprint for g in poll.rounds[1].groups for pk in g.keys) == sorted(
+            [new0.pk.fingerprint, new1.pk.fingerprint]
         )
         with pytest.raises(ValueError, match="not a member"):
             locate(poll, e.voters[0].pk)   # the old key has spent its right
@@ -561,28 +600,51 @@ class TestKeyTransfer:
 
     def test_vote_and_transfer_is_a_double_sign(self):
         e = Election(voters=6, group_size=3, rounds=2, deposit=10)
-        cheater, escape = e.voters[0], keygen()
+        cheater, escape = e.voters[0], e.new_key()
         e.transfer(cheater, escape, OPEN)
         e.vote(cheater, "yes", OPEN + 1)
         poll = e.poll_at(T0 + 300)
         assert poll.rounds[1].groups == []          # the transfer is void
         result = e.close()
         assert result.tally == {"yes": 0, "no": 0}
-        assert result.culprits == [(0, b64pk(cheater))]
+        assert result.culprits == [(0, fp(cheater), "v0")]
         assert result.slashed == 10
 
     def test_round_discipline(self):
         e = Election(voters=4, rounds=2)
-        moved = keygen()
+        moved = e.new_key()
         e.transfer(e.voters[1], moved, OPEN)
         stale = ballot_tx(e.poll_at(OPEN + 1), e.voters[0], "yes")
         with pytest.raises(StateError, match="current round is 1"):
             mine_tx(e.node, e.miner, stale, ts=T0 + 300)
         with pytest.raises(StateError, match="last round"):
             mine_tx(e.node, e.miner, key_transfer_tx(
-                e.poll_at(T0 + 300), moved, keygen().pk), ts=T0 + 300)
+                e.poll_at(T0 + 300), moved, e.new_key(2).pk), ts=T0 + 300)
 
     def test_transfer_target_must_be_new(self):
         e = Election(voters=4, rounds=2)
+        target = e.new_key()
+        e.transfer(e.voters[0], target, OPEN)
         with pytest.raises(StateError, match="already a member"):
-            e.transfer(e.voters[0], e.voters[1], OPEN)
+            e.transfer(e.voters[1], target, OPEN + 1)
+
+    def test_transfer_target_must_be_made_for_the_next_round(self):
+        e = Election(voters=4, rounds=3)
+        with pytest.raises(StateError, match="not made for the next round"):
+            e.transfer(e.voters[0], e.key("fresh"), OPEN)
+        with pytest.raises(StateError, match="not made for the next round"):
+            e.transfer(e.voters[0], e.new_key(2), OPEN)
+
+    def test_transferred_key_that_double_signs_is_voided_not_slashed(self):
+        e = Election(voters=6, group_size=3, rounds=2, deposit=10)
+        moved = e.new_key()
+        e.transfer(e.voters[0], moved, OPEN)
+        e.transfer(e.voters[1], e.new_key(), OPEN + 1)
+        round1 = T0 + 300
+        e.vote(moved, "yes", round1)
+        e.vote(moved, "no", round1 + 1)
+        result = e.close()
+        assert result.tally == {"yes": 0, "no": 0}
+        assert [(r, f) for r, f, _ in result.culprits] == [(1, fp(moved))]
+        assert result.culprits[0][2] == ""      # no registration behind it
+        assert result.slashed == 0 and result.refunded == 60

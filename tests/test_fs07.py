@@ -1,10 +1,10 @@
-"""Functional tests for the TRS scheme."""
+"""Functional tests for the FS07 traceable ring signature (comparison scheme)."""
 
 import os
 
 import pytest
 
-from trs import (
+from fs07 import (
     KeyPair,
     Signature,
     keygen,
@@ -12,8 +12,8 @@ from trs import (
     trace,
     verify,
 )
-from trs.group import Scalar, base_mul
-from trs.trs import PublicKey
+from fs07.group import Scalar, base_mul
+from fs07.scheme import PublicKey
 
 
 def make_ring(n: int) -> list[KeyPair]:
@@ -219,9 +219,9 @@ class TestTraceability:
         # supply s2 with a mismatched issue; we just confirm the construction
         # does not cross-leak. We assert by reproducing s1's σ_i_under_A and
         # s2's σ_i_under_B differ.
-        from trs.hash import hash_to_group
-        from trs.trs import DST_H0
-        from trs.serialize import encode_ring
+        from fs07.hash import hash_to_group
+        from fs07.scheme import DST_H0
+        from fs07.serialize import encode_ring
         ring_bytes = encode_ring([pk.point for pk in ring])
         h_A = hash_to_group(b"election-A" + ring_bytes, DST_H0)
         h_B = hash_to_group(b"election-B" + ring_bytes, DST_H0)
@@ -261,16 +261,3 @@ class TestAnonymity:
         s_b = sign(ring_kp[3].sk, ring_kp[3].pk, b"e", b"m", ring)
         assert s_a.A1.raw != s_b.A1.raw
 
-
-class TestProofOfPossession:
-    def test_roundtrip_and_binding(self):
-        from trs import prove_possession, verify_possession
-
-        kp, other = keygen(), keygen()
-        proof = prove_possession(kp.sk, kp.pk, b"ctx")
-        assert verify_possession(kp.pk, b"ctx", proof)
-        assert not verify_possession(kp.pk, b"other ctx", proof)
-        assert not verify_possession(other.pk, b"ctx", proof)
-        assert not verify_possession(kp.pk, b"ctx", proof[:-1])
-        forged = prove_possession(other.sk, kp.pk, b"ctx")
-        assert not verify_possession(kp.pk, b"ctx", forged)

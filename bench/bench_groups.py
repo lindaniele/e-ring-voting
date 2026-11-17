@@ -4,11 +4,13 @@ What fixed-size groups buy and what they cost.
 Two tables, both on stdout as CSV:
 
 1. ``--cost``: ballot cost as a function of the group size ``k`` for an
-   electorate of ``N`` voters. Signature size is ``36 + 64·|g|`` bytes and
-   verification is linear in ``|g|``, so one ring for everybody costs
-   ``O(N²)`` to audit while groups cost ``O(N·k)``. Verify time is measured
-   at a handful of ring sizes, fitted to ``a + b·n`` and summed over the
-   groups that :func:`voting.groups.assign_groups` actually forms.
+   electorate of ``N`` voters. Signature size and verification time are
+   linear in ``|g|`` (OTRS at λ = 128: ``5 + 2064·|g|`` bytes), so one ring
+   for everybody costs ``O(N²)`` to store and audit while groups cost
+   ``O(N·k)``. Verify time is measured at a handful of ring sizes, fitted to
+   ``a + b·n`` and summed over the groups that
+   :func:`voting.groups.assign_groups` actually forms. ``--scheme`` picks
+   ``otrs128`` (default), ``otrs256`` or ``fs07`` for comparison.
 
 2. ``--anonymity``: Monte-Carlo estimate of the anonymity an honest voter
    keeps when a fraction of the registered keys are sybils controlled by
@@ -22,6 +24,7 @@ Two tables, both on stdout as CSV:
 
 Run with:
     python3 -m bench.bench_groups --cost --voters 1000 --sizes 0,4,8,16,32
+    python3 -m bench.bench_groups --cost --scheme fs07 --voters 1000
     python3 -m bench.bench_groups --anonymity --voters 1000 --sizes 4,8,16 \\
         --sybils 0,0.25,0.5 --transfer 0.5
 """
@@ -40,15 +43,25 @@ from typing import Dict, List, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trs import keygen, sign, verify  # noqa: E402
+import otrs  # noqa: E402
 from voting.groups import assign_groups  # noqa: E402
 
 ISSUE = b"bench-groups"
 MSG = b"vote: yes"
 
+OTRS_PARAMS = {"otrs128": otrs.OTRS128, "otrs256": otrs.OTRS256}
 
-def sig_bytes(n: int) -> int:
-    return 36 + 64 * n
+
+def sig_bytes(scheme: str, n: int) -> int:
+    if scheme == "fs07":
+        return 36 + 64 * n
+    return OTRS_PARAMS[scheme].sig_bytes(n)
+
+
+def pk_bytes(scheme: str) -> int:
+    if scheme == "fs07":
+        return 32
+    return OTRS_PARAMS[scheme].key_bytes
 
 
 # --------------------------------------------------------------------------- #
@@ -56,28 +69,42 @@ def sig_bytes(n: int) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def _verify_ms(n: int, repeats: int) -> float:
-    ring_kp = [keygen() for _ in range(n)]
-    ring = [kp.pk for kp in ring_kp]
-    sig = sign(ring_kp[0].sk, ring_kp[0].pk, ISSUE, MSG, ring)
+def _verifier(scheme: str, n: int):
+    if scheme == "fs07":
+        import fs07
+
+        kps = [fs07.keygen() for _ in range(n)]
+        ring = [kp.pk for kp in kps]
+        sig = fs07.sign(kps[0].sk, kps[0].pk, ISSUE, MSG, ring)
+        return lambda: fs07.verify(sig, ISSUE, MSG, ring)
+    kps = [otrs.keygen(params=OTRS_PARAMS[scheme]) for _ in range(n)]
+    ring = otrs.Ring([kp.pk for kp in kps])
+    sig = ring.sign(kps[0], MSG, ISSUE)
+    return lambda: ring.verify(sig, MSG, ISSUE)
+
+
+def _verify_ms(scheme: str, n: int, repeats: int) -> float:
+    check = _verifier(scheme, n)
     samples = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        assert verify(sig, ISSUE, MSG, ring)
+        assert check()
         samples.append(time.perf_counter() - t0)
     return statistics.median(samples) * 1000.0
 
 
-def fit_verify(probe_sizes: Sequence[int], repeats: int):
+def fit_verify(scheme: str, probe_sizes: Sequence[int], repeats: int):
     """Least-squares fit of verify time to ``a + b·n`` (milliseconds)."""
     xs = list(probe_sizes)
-    ys = [_verify_ms(n, repeats) for n in xs]
+    ys = [_verify_ms(scheme, n, repeats) for n in xs]
     mx, my = statistics.mean(xs), statistics.mean(ys)
     b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
     return my - b * mx, b
 
 
-def bench_cost(n_voters: int, sizes: Sequence[int], a: float, b: float) -> List[dict]:
+def bench_cost(
+    scheme: str, n_voters: int, sizes: Sequence[int], a: float, b: float
+) -> List[dict]:
     members = [os.urandom(32) for _ in range(n_voters)]
     rows = []
     for k in sizes:
@@ -85,13 +112,17 @@ def bench_cost(n_voters: int, sizes: Sequence[int], a: float, b: float) -> List[
         lens = [len(g) for g in groups]
         audit_ms = sum(m * (a + b * m) for m in lens)
         rows.append({
+            "scheme": scheme,
             "voters": n_voters,
             "group_size": k,
             "groups": len(lens),
             "min_group": min(lens),
             "max_group": max(lens),
-            "mean_sig_bytes": statistics.mean(sig_bytes(m) for m in lens for _ in range(m)),
-            "ballots_mb": sum(m * sig_bytes(m) for m in lens) / 1e6,
+            "mean_sig_bytes": statistics.mean(
+                sig_bytes(scheme, m) for m in lens for _ in range(m)
+            ),
+            "ballots_mb": sum(m * sig_bytes(scheme, m) for m in lens) / 1e6,
+            "keys_mb": n_voters * pk_bytes(scheme) / 1e6,
             "verify_per_ballot_ms": audit_ms / n_voters,
             "audit_all_ballots_s": audit_ms / 1000.0,
         })
@@ -181,6 +212,7 @@ def _emit(rows: List[dict], output: Path | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--cost", action="store_true")
+    p.add_argument("--scheme", default="otrs128", choices=["otrs128", "otrs256", "fs07"])
     p.add_argument("--anonymity", action="store_true")
     p.add_argument("--voters", type=int, default=1000)
     p.add_argument("--sizes", default="0,4,8,16,32",
@@ -199,9 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     sizes = [int(x) for x in args.sizes.split(",") if x.strip()]
 
     if args.cost:
-        a, b = fit_verify([int(x) for x in args.probe.split(",")], args.repeats)
-        print(f"# verify_ms ~= {a:.3f} + {b:.4f} * ring_size", file=sys.stderr)
-        _emit(bench_cost(args.voters, sizes, a, b), args.output)
+        a, b = fit_verify(args.scheme, [int(x) for x in args.probe.split(",")], args.repeats)
+        print(f"# {args.scheme}: verify_ms ~= {a:.3f} + {b:.4f} * ring_size", file=sys.stderr)
+        _emit(bench_cost(args.scheme, args.voters, sizes, a, b), args.output)
     if args.anonymity:
         sybils = [float(x) for x in args.sybils.split(",") if x.strip()]
         rows = bench_anonymity(

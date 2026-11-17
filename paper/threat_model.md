@@ -1,53 +1,55 @@
-# e-ring-voting v0.5 — Threat Model
+# e-ring-voting v1.0 — Threat Model
 
 What the design defends against, what it does not, and which test
 exercises each claim. It complements `paper/artifact.tex`, which
 describes the mechanisms and the analysis behind them.
 
-Two system layers share the primitive (`trs/`) and the election logic
-(`voting/records.py`, `groups.py`, `tally.py`):
-
-- **The design (Architecture B, `chain/`)**: a permissionless
-  proof-of-work chain with deposits, beacon-assigned groups and
-  key-transfer rounds. Sections 1–4.
-- **The baseline (Architecture A, `voting/`)**: a t-of-N
-  threshold-signed bulletin board with a k-of-M witness federation,
-  one ring, no deposits. Section 5.
+The design is a permissionless proof-of-work chain (`chain/`) whose
+ballots are one-time traceable ring signatures (Scafuro–Zhang [SZ21],
+`otrs/`), with deposits, beacon-assigned groups and key-transfer rounds.
+The election logic shared by the chain lives in `voting/`.
 
 ## Assumptions
 
-- DDH in Ristretto255; RFC 9380 hash-to-curve and SHA-512 modelled as
-  random oracles; Ed25519 unforgeability.
-- Honest voters keep their TRS secret keys secret.
-- For B: an honest majority of hash power during the poll. For A: at
-  least t honest cohort members (liveness) and k honest witnesses
-  (equivocation evidence).
+- SHAKE256, in the roles of `G` and `H` of [SZ21], behaves as a random
+  oracle. The proofs of [SZ21] are in the *classical* random-oracle model;
+  a proof in the quantum random-oracle model is open.
+- Every honest key signs **once**: honest voters keep their master secret
+  secret, sign deterministically (as `otrs` does) and never reuse a key.
+  The chain enforces the rest (one use per key, labels).
+- Ed25519 is unforgeable for the duration of a poll (it only protects
+  accounts: sponsors, creators, payments).
+- An honest majority of hash power during the poll.
 
-## 1. Principals (B)
+## 1. Principals
 
 - **Creator**: Ed25519 account that opens a poll and fixes its
-  parameters (options, schedule, group size `k`, rounds, deposit `D`).
-  Has no power after setup: no transaction closes, tallies or freezes a
-  poll.
+  parameters (options, schedule, group size `k`, rounds, deposit `D`,
+  security parameter λ). Has no power after setup: no transaction closes,
+  tallies or freezes a poll.
 - **Sponsor**: Ed25519 account that registers a voter, paying the fee
-  and locking `D`. May be the voter, the creator or anyone else.
-- **Voter**: holds a TRS key; proves possession at registration; in each
-  round signs once, a ballot or a key transfer.
+  and locking `D`. May be the voter, the creator or anyone else. Decides
+  who is eligible (the chain does not).
+- **Voter**: makes a one-time key labelled with the poll and its handle;
+  in each round spends that key's single use on a ballot or on a key
+  transfer.
 - **Miner**: produces blocks; chooses which transactions to include and,
   within the rules, the block timestamp.
 - **Anyone**: replays the chain and obtains groups, tally, culprits and
   settlement (`python3 -m chain.cli audit`).
 
-## 2. Properties (B)
+## 2. Properties
 
 | Property | Holds? | Mechanism | Test |
 |---|---|---|---|
-| A single ballot hides its signer within its group | Yes | FS07 anonymity (DDH, ROM) | `test_trs.py::TestAnonymity` |
-| Two different messages by a key in a round expose the key | Yes | FS07 trace, per-group tag book | `test_chain.py::TestSingleRing::test_double_vote_burns_the_deposit` |
-| The deposit of a round-0 double-signer is burned, others refunded | Yes | settlement at `voting_close` | same, and `::test_full_election_tallies_and_refunds` |
-| Voting and moving in one round counts as a double-sign; the move is dropped | Yes | ballots and transfers share the tag | `test_chain.py::TestKeyTransfer::test_vote_and_transfer_is_a_double_sign` |
-| Nobody can be framed by replays | Yes | copies are *linked*, refused on chain | `test_chain.py::TestSingleRing::test_replayed_ballot_is_invalid`, `test_tally.py::TestClassify::test_replays_of_two_voters_do_not_frame_anyone` |
-| Nobody can register a key they do not control | Yes | Schnorr proof of possession | `test_chain.py::TestRegistration::test_proof_of_possession_required` |
+| A ballot hides its signer within its group | Yes, if the key is used once | one-time anonymity [SZ21] (ROM) | proof in [SZ21]; mechanism: `test_otrs.py::TestExculpability::test_signer_reveals_exactly_one_seed_per_row` |
+| A second use of a key exposes it, whatever it signs | Yes | [SZ21] trace | `test_otrs.py::TestTraceability`, `test_chain.py::TestSingleRing::test_double_vote_burns_the_deposit`, `::test_same_ballot_signed_twice_with_fresh_randomness_is_traced` |
+| `t` colluding keys get at most `t` untraced ballots in a group | Yes | public traceability [SZ21] | `test_otrs.py::TestCoalition`, `test_tally.py::TestTagBookAdmission::test_never_more_untraced_signatures_than_keys` |
+| Keys with a zero row (untraceable) cannot enter a ring | Yes | check added to [SZ21, Fig. 1] | `test_otrs.py::TestZeroRow` |
+| The deposit of a traced round-0 key is burned, others refunded | Yes | settlement at `voting_close` | `test_chain.py::TestSingleRing::test_double_vote_burns_the_deposit`, `::test_full_election_tallies_and_refunds` |
+| Voting and moving in one round is two uses; the move is dropped | Yes | ballots and transfers are both signatures of the key | `test_chain.py::TestKeyTransfer::test_vote_and_transfer_is_a_double_sign` |
+| Nobody can be framed by replays or by copied seeds | Yes | copies are byte-identical and refused; one-time exculpability [SZ21] | `test_chain.py::TestSingleRing::test_replayed_ballot_is_invalid`, `test_tally.py::TestClassify::test_copies_frame_nobody`, `test_otrs.py::TestExculpability::test_copied_seeds_do_not_frame_an_honest_signer` |
+| A key serves one poll and one handle (or one transfer round) | Yes | key labels | `test_chain.py::TestRegistration::test_key_must_be_made_for_this_poll_and_handle`, `TestKeyTransfer::test_transfer_target_must_be_made_for_the_next_round` |
 | The creator cannot choose the groups | Yes | groups ordered by a hash keyed with `prev_hash` of the freezing block, registrations closed before it | `test_groups.py::TestAssignGroups::test_organiser_cannot_target_without_the_beacon` |
 | Every group has at least `k` members (if ≥ 2k voters) | Yes | `assign_groups` | `test_groups.py::TestAssignGroups::test_partition_with_min_size` |
 | A transfer never shrinks the voter's anonymity set | Yes, for an observer that does not count | the new key hides among all origin groups of its new group | `bench/bench_groups.py --anonymity` |
@@ -55,34 +57,49 @@ Two system layers share the primitive (`trs/`) and the election logic
 | Blocks at the wrong difficulty are invalid | Yes | difficulty is a consensus rule | `test_chain.py::TestDifficultyRule` |
 | Heaviest valid chain wins | Yes | `Node.consider` | `test_chain.py::TestForkChoice` |
 
-## 3. Adversaries (B)
+## 3. Adversaries
 
 ### 3.1 Double-voter
-Signs two different messages (two ballots, or a ballot and a transfer)
-in one round. Both are void, the key is published as a culprit and, if
-it was registered in round 0, its sponsor loses `D`. At most two
-messages per signer enter the chain; a third is invalid.
+Uses its key twice in a round: two ballots, a ballot and a transfer, or
+the *same* ballot signed again with fresh randomness. Any two distinct
+signatures by one key trace it [SZ21], so every message involved is void,
+the key is published as a culprit together with the handle it was
+registered under and, if it was registered in round 0, its sponsor loses
+`D`. A signature that only traces keys already exposed is invalid, so a
+key adds at most one piece of evidence to the chain.
 
-A key obtained by transfer has no deposit; its double-sign is voided
-but not punished. Tying a deposit to it would link it to its origin,
-which is what the transfer exists to prevent. Open problem.
+A *coalition* of `t` keys in a group can split the rows it opens among
+its keys, but public traceability bounds it to `t` untraced signatures;
+the `(t+1)`-th traces one of its keys. The coalition chooses *which* of
+its keys is exposed, not whether one is.
+
+A key obtained by transfer has no deposit; its second use voids its
+messages but is not punished. Tying a deposit to it would link it to its
+origin, which is what the transfer exists to prevent. Open problem.
 
 ### 3.2 Replayer / framer
-Anyone can copy a ballot or transfer from the chain and resubmit it.
-The copy is *linked* to the original (same signer, same message) and is
-refused at block validation, so it neither changes the tally nor makes
-anyone a culprit. By FS07 exculpability, two messages traced to a key
-require its secret. (The rewrite before v0.5 got this wrong: it blamed
-ring position 1 for a pair of copies.)
+Anyone can copy a ballot or transfer from the chain and resubmit it. The
+copy is byte-identical and refused, so it neither changes the tally nor
+makes anyone a culprit. Framing needs both seeds of one of the victim's
+rows; a signature reveals only one, and copying it into another
+signature does not help (`test_copied_seeds_do_not_frame_an_honest_signer`).
 
 ### 3.3 Creator / organiser
 Chooses parameters and which keys it sponsors, but only before
 `registration_close`, before the beacon exists. It cannot place a key
 next to a target, close the poll early, publish a tally, or withhold
-refunds. It can pick a small `k`; voters should check `k` against the
-sybil share they expect (3.5).
+refunds. It can pick a small `k` (voters should check `k` against the
+sybil share they expect, §3.6) or λ = 128 rather than 256.
 
-### 3.4 Miner
+### 3.4 Sponsor / registrant
+A key's label binds it to one poll and one handle, so a registration
+seen in the mempool cannot be copied under another handle or into
+another poll. A sponsor that registers the same key and handle first
+only pays the victim's fee and deposit. Garbage keys (random rows) look
+like honest keys, as the anonymity proof requires; they are sybils that
+abstain (§3.6). Rows equal to zero are refused (§2).
+
+### 3.5 Miner
 - **Beacon bias.** The miner of the block whose hash becomes the beacon
   can discard blocks with unwanted assignments, and choose its timestamp
   so as to decide which block crosses `voting_open`. Each discarded block
@@ -96,13 +113,12 @@ sybil share they expect (3.5).
   a miner may leave them out. Honest miners include them; a majority
   that censors until a round ends disenfranchises. Not addressed.
 - **Burn, not reward.** Deposits are burned rather than paid to the
-  miner, so a miner gains nothing from double-signing with keys it
-  registered itself.
+  miner, so a miner gains nothing from tracing keys it registered itself.
 
-### 3.5 Sybil registrant
+### 3.6 Sybil registrant
 Registers many keys (paying fees and locking deposits that come back if
-the keys behave). It cannot be detected: a sybil that never double-signs
-looks honest. It shrinks the honest part of each group:
+the keys behave). It cannot be detected: a sybil used once looks honest.
+It shrinks the honest part of each group:
 
 | k | sybil share | honest set (round 0) | isolated honest voters | honest set (round 1, half move) |
 |---:|---:|---:|---:|---:|
@@ -113,51 +129,48 @@ looks honest. It shrinks the honest part of each group:
 The deposit prices misbehaviour, not registration; sybils are priced by
 the registration fee and by the sponsor's on-chain identity.
 
-### 3.6 Observer
+### 3.7 Observer
 Sees every ballot's group and every transfer's origin group.
 - **Per-group tallies are public.** A group that votes unanimously
   reveals every member's vote. Smaller `k` leaks more; transfers mix.
 - **Counting.** How many members of a group voted or moved narrows
   transfer anonymity beyond the union metric above.
-- **Cross-poll.** Sponsors' Ed25519 accounts are persistent; a voter who
-  sponsors itself links its registrations across polls. TRS keys should
-  be fresh per poll.
+- **Cross-poll.** One-time keys cannot be reused across polls (labels).
+  Sponsors' Ed25519 accounts are persistent, so a voter who sponsors
+  itself links its registrations across polls.
 
-### 3.7 Hash-power renter
+### 3.8 Quantum adversary, now or later
+- **Ballot anonymity.** Breaking it means telling which position's
+  opening seeds are a key's real seeds, a preimage search on `G` over
+  λ-bit seeds: about `2^{λ/2}` quantum work by Grover, `2^λ` classically.
+  λ = 256 keeps a 128-bit margin. Nothing in a ballot depends on discrete
+  logarithms, so ballots recorded today are not readable by a future
+  quantum computer the way FS07 ballots are.
+- **Accounts.** Ed25519 falls to a quantum computer. That matters only
+  while a poll runs (forging a sponsor or payment); past polls are fixed
+  by the chain's proof of work.
+- **Proofs.** [SZ21]'s security proofs are in the classical ROM.
+
+### 3.9 Hash-power renter
 Rents a majority for the voting window and reorganises or censors. The
 design inherits this from proof of work (Park, Specter, Narula, Rivest
 2021) and does not change it.
 
-### 3.8 Coercer / vote buyer, compromised device
-Not defended. A voter who reveals `x` lets the coercer recompute
-`h^x` and find the ballot; malware on the voter's device signs anything.
-Handing a copy of the key to a buyer is *risky* for both (if both sign,
-both lose), but a voter who sells and abstains is not deterred.
+### 3.10 Coercer / vote buyer, compromised device
+Not defended. A voter who reveals its master secret lets the coercer
+recognise its ballot (its real seeds); malware on the device signs
+anything. Handing a copy of the key to a buyer is *risky* for both (if
+both sign, the key is traced and the deposit burned), but a voter who
+sells and abstains is not deterred.
 
-## 4. Not provided (B)
+### 3.11 Careless wallet
+A wallet that signs with fresh randomness and retries, or that reuses a
+key, makes a second signature: the key is traced and the deposit burned.
+`otrs` signs deterministically, so a retry is a harmless copy.
+
+## 4. Not provided
 
 Receipt-freeness and coercion resistance; slashing of transferred keys;
 an unbiasable beacon; incentives to include fee-less ballots; hiding
-per-group tallies; post-quantum security; a network layer; constant-time
-Python glue.
-
-## 5. Baseline (A): federated bulletin board
-
-Principals: a cohort of N publishers (any t co-sign each entry), voters,
-M witnesses (co-sign log heads), auditors.
-
-| Property | Holds? | Test |
-|---|---|---|
-| Anonymity in the (single) ring | Yes | `test_trs.py::TestAnonymity` |
-| Double-vote traced and both ballots excluded | Yes, no penalty | `test_election.py::TestDoubleSign::test_double_sign_excludes_both_ballots` |
-| Replayed copies neither drop votes nor frame | Yes | `test_election.py::TestDoubleSign::test_replayed_copies_neither_drop_votes_nor_frame`, `::test_manager_refuses_linked_ballot` |
-| Forged / tampered ballots rejected | Yes | `test_election.py::TestAdversaries` |
-| Fewer than t publishers cannot append | Yes | `test_threshold.py::TestThresholdAppend` |
-| Equivocation by ≥ t publishers produces evidence | Yes, with witnesses | `test_threshold.py::TestWitnesses::test_equivocation_detected` |
-| Claimed tally refuted if wrong | Yes | `test_election.py::TestAdversaries::test_audit_rejects_extra_record_after_tally` |
-| Liveness against a unanimous cohort | No | — |
-| Who forms the ring | The cohort | — |
-
-A suits a small, accountable authority set and fast finality. It gives
-nothing that B's deposits, beacon groups and transfers give, and B gives
-up A's named accountability and instant finality.
+per-group tallies; a QROM proof of the primitive; post-quantum accounts;
+a network layer; constant-time code.

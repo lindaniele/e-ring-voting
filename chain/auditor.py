@@ -5,7 +5,7 @@ Loading a chain through :class:`chain.node.Node` replays every rule from
 genesis:
 
 * block PoW at the prescribed difficulty, linkage, coinbase amounts,
-* per-tx signatures, nonces, balances, deposits and proofs of possession,
+* per-tx signatures, nonces, balances, deposits and key labels,
 * every ballot and key transfer verified against its group,
 * the poll lifecycle (freeze, regrouping, tally, slashing, refunds), which
   the chain computes itself at the deadlines.
@@ -38,7 +38,7 @@ class PollAuditReport:
     registered: int
     group_sizes: List[List[int]]              # per round, per group
     tally: Optional[Dict[str, int]]           # None until the poll closes
-    culprits: List[Tuple[int, str]] = field(default_factory=list)
+    culprits: List[Tuple[int, str, str]] = field(default_factory=list)
     slashed: int = 0
     refunded: int = 0
     transfers: List[int] = field(default_factory=list)

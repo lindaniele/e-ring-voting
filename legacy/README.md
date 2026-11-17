@@ -7,8 +7,18 @@ repository. About 1 560 lines of Python 3 + asyncio.
 This README was written in 2026, from the code and from the project's
 git history (the 2021 and 2022 versions of the top-level README, which
 described the procedure). An earlier 2026 version of this file got
-several things wrong (it called the signature Scafuro–Zhang, said it
-worked, and called the chain rule "GHOST"); they are corrected below.
+several things wrong (it called the code's signature Scafuro–Zhang, said
+it worked, and called the chain rule "GHOST"); they are corrected below.
+
+**Which signature.** The design wanted a *one-time* traceable ring
+signature, the Scafuro–Zhang scheme (ESORICS 2021), because a poll is
+"one key, one signature". Niccolò Pagano implemented that scheme
+separately, in C with a Python wrapper, in December 2022 – January 2023
+(`github.com/NickP005/my-cryptography`, published on PyPI as
+`crypto-otrs`). The code in *this* directory predates that and implements
+the Fujisaki–Suzuki scheme (PKC 2007) instead. The current repository
+re-implements Scafuro–Zhang from the paper in `otrs/` and keeps a fixed
+Fujisaki–Suzuki in `fs07/` for comparison.
 
 ## What the prototype was for
 
@@ -18,6 +28,7 @@ procedure in the old README and from the code:
 
 | Idea | Source |
 |---|---|
+| A one-time traceable ring signature (Scafuro–Zhang 2021) as the primitive | the design's intent; Pagano's separate C implementation, 2022–23 |
 | Ring signature with `issue` and a tag `issue ‖ ring`; trace outputs `"linked"`, `"indep"` or the culprit's key | `cryptography/ring.py` — this is Fujisaki–Suzuki, *Traceable Ring Signature*, PKC 2007 |
 | Voters split into groups of fixed size ("members per group", "group size") declared when the poll is reserved | README, Nov 2021 and Apr 2022 |
 | Two kinds of signed message: a vote (`$`) or a transfer (`*`) "to another group with another key" | comment above `encode_tag`, `cryptography/ring.py:59` |
@@ -26,9 +37,12 @@ procedure in the old README and from the code:
 | Poll timing in block numbers; poll data split into chunks committed by hash in a reservation transaction | README, Nov 2021 and Apr 2022 |
 | SHA-256 PoW, heaviest chain by Σ 2^difficulty, difficulty adjusted on the median of the last 11 blocks | `mining/` |
 
-The current code in `chain/` completes this design. The one element
-that is new there is a deposit per *voter*, burned when that voter's key
-is traced, rather than a forfeit locked by the manager.
+The current code in `chain/` completes this design. Two elements are
+new there: a deposit per *voter*, burned when that voter's key is traced,
+rather than a forfeit locked by the manager; and key labels, which bind a
+one-time key to its poll and handle in place of the voter-signed
+registration (a one-time key cannot sign its registration without
+spending its only signature).
 
 ## What the code actually did
 
@@ -102,11 +116,12 @@ data/                   settings, block index, known peers, example blocks
 
 | Prototype | Now |
 |---|---|
-| `cryptography/ring.py` | `trs/` — the same scheme over Ristretto255, RFC 9380 hash-to-curve (no known discrete log), inverse modulo `q`, `os.urandom` |
+| the intended one-time signature | `otrs/` — Scafuro–Zhang over SHAKE256, λ = 128 or 256, with a zero-row key check and deterministic signing |
+| `cryptography/ring.py` | `fs07/` — the same scheme over Ristretto255, RFC 9380 hash-to-curve (no known discrete log), inverse modulo `q`, `os.urandom`; used only as a baseline |
 | group size | `voting/groups.py` — groups drawn from a block-hash beacon after registration closes |
 | `$` vote / `*` transfer | `KeyTransfer` records and rounds in `chain/state.py` |
-| voter-signed registration, paying benefactor | proof of possession (`trs/pop.py`) and sponsor in `register_voter` |
-| forfeit vs fee | per-voter deposit, burned on tracing, refunded otherwise |
+| voter-signed registration, paying benefactor | key labels (`voting/records.py`) and sponsor in `register_voter` |
+| forfeit vs fee | per-voter deposit, burned when the key is traced, refunded otherwise |
 | `mining/` | `chain/` — required difficulty and heaviest-chain fork choice enforced at validation |
 | block-number timing | block timestamps drive every phase |
 

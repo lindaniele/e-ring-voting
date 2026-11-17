@@ -8,10 +8,11 @@ Two things we want to measure:
    cost; ledger application is microseconds.
 
 2. **End-to-end election cost**: wall-clock of a complete election on
-   the chain (setup, N voter registrations with proof of possession, N
-   ballots, the closing block that tallies and settles deposits, cold
-   audit), with one ring for everybody (``--group-size 0``) or with
-   beacon-assigned groups.
+   the chain (setup, N voter registrations, N ballots, the closing block
+   that tallies and settles deposits, cold audit), with one ring for
+   everybody (``--group-size 0``) or with beacon-assigned groups. Ballots
+   are one-time traceable ring signatures at λ = 128 (``--security 256``
+   for the larger parameter set).
 
 Difficulty is pinned low (a few leading zero bits) so the benchmark
 finishes in seconds rather than minutes. The PoW cost scales as
@@ -45,12 +46,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
 from chain.auditor import audit_chain
-from chain.client import ballot_tx, registration_tx
+from chain.client import ballot_tx, registration_tx, voter_key
 from chain.mining import mine_block
 from chain.node import Node, make_genesis_node
 from chain.state import ChainParams, state_for_next_block
 from chain.transactions import Transaction, make_coinbase, make_setup_poll
-from trs import keygen
 from voting.records import ElectionSetup
 
 
@@ -154,7 +154,7 @@ def bench_pow(difficulties: List[int], repeats: int = 5) -> List[dict]:
 def _build_setup(
     creator_pk: bytes, *, registration_close: int,
     voting_open: int, voting_close: int, group_size: int, deposit: int,
-    options=("yes", "no"), title="Bench",
+    security: int = 128, options=("yes", "no"), title="Bench",
 ) -> ElectionSetup:
     import hashlib
     eid = hashlib.sha256(
@@ -168,15 +168,15 @@ def _build_setup(
         registration_close=registration_close,
         voting_open=voting_open,
         voting_close=voting_close,
-        cohort_pks_b64=[b64encode(creator_pk).decode()],
-        threshold=1,
         group_size=group_size,
         deposit=deposit,
+        security=security,
     )
 
 
 def bench_election(
-    voter_counts: List[int], difficulty: int = 8, group_size: int = 0
+    voter_counts: List[int], difficulty: int = 8, group_size: int = 0,
+    security: int = 128,
 ) -> List[dict]:
     """Run a complete election on the chain at each voter count and
     report per-phase wall-clock plus full audit cost."""
@@ -210,6 +210,7 @@ def bench_election(
             voting_close=voting_close,
             group_size=group_size,
             deposit=10,
+            security=security,
         )
         ts = T_setup
         t0 = time.perf_counter()
@@ -222,14 +223,16 @@ def bench_election(
         _mine_tx(node, miner_pk, tx, fee=params.setup_fee, timestamp=ts)
         setup_ms = (time.perf_counter() - t0) * 1000.0
 
-        # ---------- register N voters (with proof of possession) ----------
-        voters = [keygen() for _ in range(n)]
+        # ---------- register N voters ----------
+        voters = [
+            voter_key(setup.election_id, f"v{i}", security=security) for i in range(n)
+        ]
         t0 = time.perf_counter()
         for i, kp in enumerate(voters):
             ts += 1
             tx = registration_tx(
                 sponsor_pk_raw=creator_pk, sponsor_sk=creator_sk,
-                election_id=setup.election_id, voter=kp, handle=f"v{i}",
+                election_id=setup.election_id, voter_pk=kp.pk, handle=f"v{i}",
                 fee=params.registration_fee, deposit=setup.deposit,
                 nonce=node.state.nonce(creator_b64),
             )
@@ -246,7 +249,7 @@ def bench_election(
             poll = state_for_next_block(node.state, ts).polls[setup.election_id]
             tx = ballot_tx(poll, kp, choice)
             sig_bytes.append(len(b64decode(
-                json.loads(b64decode(tx.body["payload_b64"]))["trs_sig_b64"]
+                json.loads(b64decode(tx.body["payload_b64"]))["sig_b64"]
             )))
             _mine_tx(node, miner_pk, tx, fee=0, timestamp=ts)
             ts += 1
@@ -277,6 +280,7 @@ def bench_election(
 
         rows.append({
             "voters": n,
+            "security": security,
             "group_size": group_size,
             "groups": len(rep.group_sizes[0]),
             "setup_ms": setup_ms,
@@ -308,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="Comma-separated voter counts for end-to-end bench")
     p.add_argument("--group-size", type=int, default=0,
                    help="Group size for the end-to-end bench (0 = one ring)")
+    p.add_argument("--security", type=int, default=128, help="OTRS λ: 128 or 256")
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--output", type=Path, default=None,
                    help="Write CSV results here in addition to stdout")
@@ -320,9 +325,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         diff = int(args.difficulty.split(",")[0])
         voters = [int(s) for s in args.voters.split(",") if s.strip()]
-        rows = bench_election(voters, difficulty=diff, group_size=args.group_size)
+        rows = bench_election(
+            voters, difficulty=diff, group_size=args.group_size, security=args.security
+        )
         fieldnames = [
-            "voters", "group_size", "groups", "setup_ms", "register_total_ms",
+            "voters", "security", "group_size", "groups", "setup_ms", "register_total_ms",
             "register_per_voter_ms", "ballots_total_ms", "ballot_per_voter_ms",
             "mean_sig_bytes", "close_ms", "audit_ms", "chain_kb",
         ]

@@ -40,7 +40,7 @@
 \title{\textbf{E-Ring Voting --- Explain Like I'm Five}\\[0.4em]
        \large A walk-through with no math, for a curious high-schooler}
 \author{Daniele Lin \and Niccol\`o Pagano}
-\date{October 2026}
+\date{November 2026}
 
 \begin{document}
 \maketitle
@@ -87,7 +87,7 @@ like they contradict each other. ``The votes are secret'' usually
 means ``trust us, you can't see them.'' ``Anyone can recompute''
 usually means ``the votes are public.'' How can both be true?
 
-The whole project is built around one mathematical trick that breaks
+The whole project is built around one cryptographic trick that breaks
 the contradiction, plus one idea of ours on top: the same trick can
 make cheating \emph{cost money}. The rest of these notes explain the
 trick (in words), our idea, what we built, and where the limits are.
@@ -141,472 +141,330 @@ sounds nice but vague. The next sections build up each one.
 Here is the key idea, in an analogy.
 
 \begin{aside}[The crowd analogy]
-Suppose 50 people are in a room. One of them stands up and shouts
-\emph{``I am one of the 50 people in this room.''} You believe them
---- they can prove it by, say, holding up a list of all 50 names
-including their own. But there is no way to tell \emph{which} of the
-50 it was. They could be any of them.
+Suppose 8 people are in a room behind a curtain. A note slides out under
+the curtain, signed \emph{``one of the 8 people in this room.''} You can
+check that it really came from one of them, but there is no way to tell
+\emph{which}.
 
-A \textbf{ring signature} is the digital version of that. It is a way
-to sign a message such that the signature proves \emph{``one of these
-50 people signed this,''} without revealing which one.
+A \textbf{ring signature} is the digital version of that. It proves
+\emph{``one of these 8 people signed this''} without revealing which one.
+The list of people is called the \emph{ring}.
 \end{aside}
 
-A real-world example you have probably encountered without realising:
-when a whistleblower leaks something to a journalist and the journalist
-says ``a source inside the company,'' the source is anonymous within
-the crowd ``employees of the company.'' If the company has 5000
-employees, the crowd is big enough to hide in. If the company has 3
-employees, it isn't.
-
-So if every voter in our election has a digital ``signature key'' (a
-secret number only they know), and every voter publishes their
-``signature lock'' (a public number that proves who they are), then we
-can build the ballot like this:
+So if every voter has a secret key and publishes a public key, a ballot
+can be built like this:
 
 \begin{itemize}[leftmargin=*]
   \item Alice wants to vote for pasta.
-  \item She uses her secret key to produce a \emph{ring signature} on
-        the word ``pasta.'' The ring is \emph{everyone's public
-        locks}, including hers, mixed together.
-  \item Anyone in the world can check the signature: it is valid, so
-        \emph{one of the 50 registered voters} voted for pasta.
-  \item Nobody can tell it was Alice. Not even the teacher.
+  \item She makes a ring signature on the word ``pasta'', with a ring of
+        8 public keys, including hers.
+  \item Anyone can check it: \emph{one of these 8 registered voters}
+        voted for pasta.
+  \item Nobody can tell it was Alice. Not even the organiser.
 \end{itemize}
 
-This is property 1 from before. The ballot is publicly visible, but
-the \emph{voter} is hidden inside the crowd of registered voters.
-
-\begin{aside}[Why this is mathematically possible]
-The math behind ring signatures uses something called \emph{public-key
-cryptography} --- the same family of math that protects your bank
-website (the little padlock in the browser). The trick is that with the
-right kind of math, you can build a signature that depends on
-\emph{at least one} person's secret key, but doesn't reveal
-\emph{which} one. From the outside, all 50 possible signers look
-equally likely to have produced it.
-
-The exact construction we use was proposed in 2007 by two researchers,
-Eiichiro Fujisaki and Koutarou Suzuki, under the name \emph{traceable
-ring signature}. The repository implements their recipe step by step.
-\end{aside}
+That is property 1 from before. The ballot is public, the voter is hidden
+in the crowd.
 
 % ===========================================================================
 \section{The double-vote problem}
 % ===========================================================================
 
-If the ballot hides the voter, what stops Alice from voting twice?
+If the ballot hides the voter, what stops Alice from voting twice? A plain
+ring signature does not. The kind we use, a \textbf{one-time traceable ring
+signature} (invented by Alessandra Scafuro and Bihan Zhang in 2021), has a
+simple rule: \emph{each key may sign once}. Sign once and you are invisible.
+Sign a second time, \emph{anything at all}, and everybody learns which key
+it was.
 
-Plain ring signatures don't stop her. She could sign ``pasta'' once,
-then sign ``pizza'' again, and there would be no way to tell that
-both signatures came from the same person.
+Here is how it works, with boxes instead of maths.
 
-The fix is a feature called \textbf{traceability}. Here is the
-analogy:
-
-\begin{aside}[The wax-seal analogy]
-Imagine that when you sign a ballot, the signature automatically
-imprints a unique seal --- like a wax stamp --- that depends only on
-\emph{you} and \emph{this election}. The seal is the same every time
-\emph{you} sign in \emph{this} election, no matter what the ballot
-says. But the seal is also \emph{cryptographically scrambled} so that
-nobody can read it as ``this is Alice's seal'' --- it just looks like
-random noise.
+\begin{aside}[Trick boxes]
+Every voter owns 128 little \textbf{trick boxes}, lined up in a row, and
+shows the row to everyone: that row is the public key.
 
 \medskip
-Now consider what happens if Alice signs two different ballots
-(``pasta'' and ``pizza''):
-\begin{itemize}
-  \item The two signatures have the same scrambled seal --- because
-        both came from Alice in this election.
-  \item Anyone comparing the two ballots can see ``hey, these have a
-        matching seal --- the same person produced both.''
-  \item And, by a bit of further math, the matching seal actually
-        reveals \emph{which} voter (which public lock) it belongs to.
-        So Alice is publicly named as the cheater.
-\end{itemize}
+A normal box can be closed with a ``0'' or a ``1'' inside, and later
+opened to show which. Anybody can close anybody's box, but once it is
+closed it can only be opened to show what was really put in.
 
 \medskip
-But if Alice signs only \emph{once}, her seal is on exactly one
-ballot. No other ballot has it. So the seal stays scrambled,
-unreadable, and Alice remains anonymous inside the 50-voter ring.
+A trick box has a secret: its owner holds \emph{two} little keys for it, a
+``0-key'' and a ``1-key''. With those, the owner can close the box
+\emph{empty} and decide \emph{later} whether it opens as 0 or as 1. Nobody
+else can do that.
+
+\medskip
+And here is the catch, the heart of the whole project: \textbf{if anyone
+ever sees both keys of the same box, they can check that both fit, and
+they know whose box it is.}
 \end{aside}
 
+\textbf{Signing a ballot.} Alice closes 128 boxes for each of the 8 people
+in the ring, using the other seven people's boxes honestly (with random 0s
+and 1s that she picks) and her own boxes empty. Then a \emph{lottery
+machine} (a hash function) looks at everything she closed and at the word
+``pasta'' and prints a random 128-digit number of 0s and 1s. The rule for a
+valid signature: the 8 rows of 0s and 1s inside the boxes must ``add up''
+to the lottery number. Alice could not know the number in advance, so the
+seven honest rows will not add up by themselves; but her own boxes are
+still undecided, so she opens each one as whatever digit makes the sum
+right. She shows a 0-key here, a 1-key there.
+
+\textbf{Checking.} Anyone opens all the boxes, runs the lottery machine
+again, and checks the sum. Every box opens correctly. Nothing shows which
+row was the flexible one, so Alice is hidden among the 8.
+
+\textbf{Signing twice.} If Alice signs again, even ``pasta'' again, the
+lottery prints a new number. Her own boxes have to open differently in at
+least one place: a box that showed its 0-key last time must now show its
+1-key. Now both keys of that box are public, and anyone can see that they
+fit Alice's box. She is named.
+
 This is the cleverest part of the whole system. The same signature
-both \emph{protects} you when you behave honestly and
-\emph{exposes you} the moment you try to cheat.
+\emph{protects} you when you behave and \emph{exposes} you the moment you
+cheat, and nobody has to judge you: the two signatures are the proof.
 
 \begin{warning}
-This trick works \emph{only within one election}. A different
-election has a different seal-recipe, so Alice's seal looks completely
-different from one election to the next. You cannot use it to track a
-voter across elections.
+``Once'' really means once. Signing the same ballot twice also gets you
+caught. So our program never makes up fresh random numbers when it signs:
+it computes them from your secret and the ballot, so if your computer
+resends a ballot, it sends an exact copy, which is harmless.
 \end{warning}
+
+\begin{aside}[We found a hole]
+What if somebody makes a ``box'' that is not really a box: one where the
+0-key and the 1-key are the same key? Then any key opens it either way, and
+showing it twice reveals nothing. A cheater with a row of such fake boxes
+could vote as often as they liked and never be caught. The original paper
+does not check for this. Our program does: a public key with a fake box is
+refused.
+\end{aside}
 
 % ===========================================================================
 \section{Where do you write everything down?}
 % ===========================================================================
 
-Anonymity (the ring signature) and one-vote-per-person (the traceable
-seal) are the cryptographic core. But for an auditor to actually
-\emph{check the count}, the ballots have to live somewhere public.
-
-We call this public place the \textbf{bulletin board}. Think of it as
-a notice board in the middle of a town square. Anyone can read it.
-Nobody can erase entries. Every new entry shows the time it was
-posted. And every entry has a tiny pointer to the previous entry, so
-you can scroll back through the entire history.
+The ballots have to live somewhere public, where anyone can read them and
+nobody can erase them. We use a \textbf{blockchain}, the same kind of
+public record Bitcoin uses: a list of \emph{blocks}, each containing some
+records and a pointer to the block before it.
 
 \begin{center}
 \begin{tikzpicture}[
   every node/.style={font=\small},
   entry/.style={draw, rounded corners=2pt, minimum width=2.6cm, minimum height=1.2cm, fill=blue!4},
 ]
-\node[entry] (e0) {\shortstack{Entry 0\\\itshape election setup}};
-\node[entry, right=0.4cm of e0] (e1) {\shortstack{Entry 1\\\itshape Alice registers}};
-\node[entry, right=0.4cm of e1] (e2) {\shortstack{Entry 2\\\itshape Bob registers}};
-\node[entry, right=0.4cm of e2] (e3) {\shortstack{Entry 3\\\itshape ring published}};
-\node[entry, right=0.4cm of e3] (e4) {\shortstack{Entry 4\\\itshape ballot \#1}};
+\node[entry] (e0) {\shortstack{Block 0\\\itshape start}};
+\node[entry, right=0.4cm of e0] (e1) {\shortstack{Block 1\\\itshape poll opens}};
+\node[entry, right=0.4cm of e1] (e2) {\shortstack{Block 2\\\itshape Alice registers}};
+\node[entry, right=0.4cm of e2] (e3) {\shortstack{Block 3\\\itshape Bob registers}};
+\node[entry, right=0.4cm of e3] (e4) {\shortstack{Block 4\\\itshape a ballot}};
 \draw[->, gray] (e1) -- (e0);
 \draw[->, gray] (e2) -- (e1);
 \draw[->, gray] (e3) -- (e2);
 \draw[->, gray] (e4) -- (e3);
-\node[below=0.2cm of e2, gray] {\textit{each entry points back to the one before it}};
+\node[below=0.2cm of e2, gray] {\textit{each block points back to the one before it}};
 \end{tikzpicture}
 \end{center}
 
-The key property: \textbf{if anyone tries to silently edit an old
-entry, the pointer chain breaks.} The whole point of the chain is to
-make tampering loud --- a single changed byte invalidates every entry
-that came after.
-
-\textbf{The state of the election goes through phases on the board:}
-
-\begin{enumerate}[leftmargin=*]
-  \item \textbf{Setup.} The election parameters are written: options
-        (pasta / pizza / focaccia), the schedule (when voting opens
-        and closes), and who is allowed to run the election.
-  \item \textbf{Registration.} Each voter's public lock is added.
-        After registration closes, the list of voters is frozen.
-  \item \textbf{Ring.} The frozen list is published as ``the ring'' ---
-        the official anonymity crowd. From now on, ring signatures
-        from anyone in this crowd are valid ballots.
-  \item \textbf{Ballots.} Voters cast their ring-signed ballots. Each
-        one gets a new line on the bulletin board.
-  \item \textbf{Closed.} When the schedule says voting is over, the
-        bulletin board is sealed.
-  \item \textbf{Tally.} The organisers publish their count --- but
-        crucially, anyone can recompute it from the public ballots
-        and contradict them if they cheat.
-\end{enumerate}
-
-% ===========================================================================
-\section{Who is allowed to write on the board?}
-\label{sec:who}
-% ===========================================================================
-
-This is where the project gets interesting, because there are two very
-different sensible answers, and we implemented \emph{both} so we could
-compare them.
-
-\subsection{Option A: a small named team (the ``federated'' answer)}
-
-A small group of named people --- say, 3 trusted scrutineers,
-publicly identified by name --- jointly run the bulletin board. To
-write a new entry, at least 2 of the 3 have to digitally co-sign it.
-
-\begin{itemize}[leftmargin=*]
-  \item \textbf{Good news:} fast. No expensive computation. Everyone
-        knows who they are.
-  \item \textbf{Good news:} a corrupt minority can't cheat. If
-        scrutineer~1 alone tries to add a fake ballot, scrutineers~2
-        and~3 refuse to sign and the entry is invalid.
-  \item \textbf{What if two of them go bad together?} We add another
-        layer: a separate group of \emph{witnesses} (say, three more
-        named observers) who occasionally take a snapshot of the
-        board and sign it. If the two corrupt scrutineers tried to
-        show ``ledger version A'' to one witness and ``ledger version
-        B'' to another, the two witnesses would later disagree on
-        what they saw, and the disagreement is mathematical proof
-        of cheating.
-\end{itemize}
-
-This is the same family of system as the one that secures HTTPS
-certificates on the web (``Certificate Transparency''), and the same
-shape as Sigsum (used for signed software releases). It is a
-well-known pattern for keeping known parties honest.
-
-\subsection{Option B: anybody can write (the ``blockchain'' answer)}
-
-The other answer is the Bitcoin-style answer: don't pick a small named
-team at all. Instead, \emph{anyone} on the internet can compete to
-add the next entry. The competition is solving a small puzzle (the
-``proof of work''): basically, your computer guesses random numbers
-until one of them, when hashed, has enough leading zeros. The first
-person to find a good number gets to add the next block of ballots,
-and gets paid a small reward.
+If anyone silently edits an old block, the pointers break. Who adds the
+next block? Anyone who wins a small puzzle: their computer guesses random
+numbers until one of them, when hashed, starts with enough zeros. That is
+called \emph{proof of work}. Nobody is in charge, and every computer that
+follows the chain checks every rule itself.
 
 \begin{aside}[Why the puzzle?]
-The puzzle exists to make it expensive to take over the system. If
-adding entries were free, anyone could pretend to be a thousand
-different identities at once and stuff the chain with fake entries.
-The puzzle forces each ``identity'' to do real computational work,
-which costs electricity, which costs money. So a faker has to pay for
-every block they add.
+It makes taking over the record expensive. To rewrite history you would
+have to redo all that guessing faster than everyone else put together.
+The flip side, pointed out by Park, Specter, Narula and Rivest (MIT, 2021):
+for an election that matters a lot, someone could \emph{rent} enough
+computers for the few days of the vote. A blockchain is not magic.
 \end{aside}
 
-\begin{itemize}[leftmargin=*]
-  \item \textbf{Good news:} no named team. Anyone with a computer can
-        participate. No genesis-pinned trust.
-  \item \textbf{Bad news:} the puzzle is slow (blocks take minutes,
-        not seconds). The system runs an internal mini-currency
-        (``eVotes'') to pay the puzzle-solvers.
-  \item \textbf{Bigger bad news:} for an election that matters
-        politically, an attacker can \emph{rent} a huge amount of
-        computer power online (services like NiceHash sell hashrate
-        by the hour). If their incentive --- e.g., swinging the
-        outcome of a corporate-board election worth millions of
-        dollars --- is bigger than what it costs to rent the
-        computing power for the voting window, they win. This is the
-        argument that Park and Specter (MIT, 2021) made in a famous
-        paper called \textit{Going from bad to worse: from internet
-        voting to blockchain voting.}
-\end{itemize}
-
-\subsection{The honest comparison}
-
-\begin{center}\small
-\begin{tabularx}{\linewidth}{l X X}
-\toprule
-& \textbf{Option A (named team)} & \textbf{Option B (open mining)} \\
-\midrule
-Who can write?           & A known team (e.g., 2-of-3 scrutineers) & Anyone with a computer \\
-How fast?                & Seconds                                  & Minutes (slow on purpose) \\
-Operating cost?          & Just the team's time                     & Electricity for the puzzle \\
-Built-in currency?       & No                                        & Yes (otherwise nobody mines) \\
-Best protection against? & A corrupt minority of the team           & A corrupt minority of miners \\
-Weakest if?              & The team unanimously corrupts             & Someone rents enormous hashpower \\
-\bottomrule
-\end{tabularx}
-\end{center}
-
-\textbf{Neither is universally better.} The named-team option works
-when the election has named accountable scrutineers (a school senate,
-a co-op board, an inter-institution committee). The blockchain option
-works when there is genuinely \emph{no} group anyone trusts to be the
-team --- even a small one. The cost of that second case is that you
-have to defend against rented-hashpower attacks, which gets
-\emph{harder} the higher the political stakes.
+The poll goes through phases, and the chain moves it along by the clock,
+without anyone pressing a button: \textbf{registration} (voters are
+added), \textbf{voting} (in one or more rounds), and \textbf{close} (at
+which every computer counts the ballots by itself; nobody announces a
+result that could differ from it).
 
 % ===========================================================================
 \section{Our idea: make cheating cost money}
 % ===========================================================================
 
-Most systems that use the magic envelope stop at ``if you vote twice,
-both of your votes are thrown away''. That is fair, but it costs the
-cheater nothing, so trying is free. The seal trick can do more: it
-tells everybody \emph{who} cheated. On Option~B, where there is a
-currency anyway, we use that.
+Most systems that hide voters stop at ``if you vote twice, your extra vote
+is thrown away''. That is fair, but it costs the cheater nothing, so trying
+is free. Our signatures tell everybody \emph{who} cheated, and a blockchain
+has money (we call it \emph{eVotes}). So:
 
 \begin{aside}[The deposit]
-When you register to vote, someone (you, or the organisation that
-vouches for you) locks a small amount of eVotes, like a deposit on a
-rented flat. If you vote once, you get it back after the election. If
-you sign twice, your seal shows up twice, the system names you, and the
-deposit is \emph{destroyed}. Nobody decides this; it is a rule that
-every computer checking the chain applies by itself.
+When you register to vote, someone (you, or the organisation that vouches
+for you) locks a small deposit, like on a rented flat. Vote once, and it
+comes back after the poll. Use your key twice, and the chain names your key
+and \emph{destroys} the deposit. Nobody decides this; it is a rule that
+every computer checking the chain applies.
 \end{aside}
 
-Destroyed, not given to anyone: if the person who builds the next block
-got the money, they would have a reason to create cheaters on purpose.
+Destroyed, not given to anyone: if the person who builds the next block got
+the money, they would have a reason to create cheaters on purpose.
 
-\paragraph{Small groups instead of one huge crowd.} A magic envelope
-gets bigger with every person in the crowd: hiding among 1{,}000 people
-makes each ballot 64~kilobytes and slow to check. So voters are split
-into groups of, say, 8. But who decides the groups? If the organiser
-did, they could put you in a group with 7 people they control, and then
-your ballot is obviously yours. So nobody decides: the groups are
-shuffled using a random-looking number (the fingerprint of a block)
-that did not exist yet when registration closed.
+\paragraph{Keys made for one poll.} Each key carries a little public label
+saying which poll and which voter name it was made for. The chain refuses
+it anywhere else, so nobody can copy your registration under another name
+or use your key in another poll.
+
+\paragraph{Small groups instead of one huge crowd.} These signatures are
+big: about 2 kilobytes for every person in the crowd. Hiding among 1{,}000
+people would make every ballot 2 megabytes. So voters are split into groups
+of, say, 8 (a ballot is then 16 kilobytes). But who decides the groups? If
+the organiser did, they could put you with 7 people they control, and then
+your ballot is obviously yours. So nobody decides: the groups are shuffled
+using the fingerprint of a block that did not exist yet when registration
+closed.
 
 \paragraph{Changing group.} A small group is a small crowd. So in each
-round, instead of voting, you may hand your vote to a brand-new key of
-yours, which is put into a new group in the next round. Everybody sees
-that \emph{someone} in your old group moved, not who. When you then vote
-from the new group, you are hiding among all the old groups your new
-group-mates came from. Voting \emph{and} moving in the same round counts
-as signing twice.
+round, instead of voting, you may use your one signature to hand your vote
+to a brand-new key, which is put into a new group in the next round.
+Everybody sees that \emph{someone} in your old group moved, not who. When
+you then vote from the new group, you hide among all the old groups your
+new group-mates came from. Voting \emph{and} moving in the same round uses
+your key twice, and you get caught.
 
-\paragraph{Where the idea came from.} We sketched all of this in
-2021--22 (group size, ``vote or move'', a forfeit separate from fees,
-voters signing their own registration). This version finishes it and
-makes the deposit per voter.
+\paragraph{Where the idea came from.} We sketched all of this in 2021--22:
+groups, ``vote or move'', a forfeit separate from fees, and a one-time
+signature, because a poll is exactly ``one person, one signature''. This
+version finishes it.
+
+% ===========================================================================
+\section{Why this kind of signature}
+% ===========================================================================
+
+Our 2021 prototype actually used an older kind of traceable signature
+(Fujisaki and Suzuki, 2007), built on the same kind of maths as the
+padlock in your browser. It makes much smaller ballots, about 30 times
+smaller. So why switch?
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{A blockchain never forgets.} Every ballot stays on it
+        forever.
+  \item \textbf{A big enough quantum computer} (which does not exist yet)
+        would break the padlock maths. With the old signature, it could go
+        back and unmask \emph{every ballot ever cast}.
+  \item The one-time signature is built from nothing but a hash function
+        (the lottery machine). No known quantum trick unmasks it.
+\end{itemize}
+
+Ballots only need to be \emph{valid} until the poll closes, but they need
+to stay \emph{secret} for decades. So we pay with size and get secrecy
+that should last. And it is even faster to check.
 
 % ===========================================================================
 \section{What this project actually built}
 % ===========================================================================
 
 \begin{itemize}[leftmargin=*]
-  \item \texttt{trs/} --- the cryptography (the magic envelope + the
-        seal trick). About 1{,}000 lines of Python.
-  \item \texttt{chain/} --- Option B with our idea: deposits, groups,
-        changing group. About 2{,}200 lines.
-  \item \texttt{voting/} --- the shared election rules, plus Option A
-        (the named-team bulletin board) as the point of comparison.
+  \item \texttt{otrs/}: the signature (trick boxes and lottery). About 750
+        lines of Python, using nothing but a hash function.
+  \item \texttt{voting/} and \texttt{chain/}: the rules of the poll and the
+        blockchain that enforces them: deposits, labels, groups, changing
+        group, counting.
+  \item \texttt{fs07/}: the old kind of signature, fixed, only to compare.
 \end{itemize}
 
-Plus 165 automated tests that check the whole thing works the way we
-say it does.
+Plus 164 automated tests that check the whole thing works the way we say,
+including tests that \emph{attack} it: double votes, copied ballots,
+groups of cheaters working together, and the fake-box trick.
 
-Some numbers. With 1{,}000 voters in one crowd, checking all ballots
-takes over five minutes; in groups of 8 it takes under three seconds.
-If an attacker registers half of all voters as fake people, a voter in
-a group of 8 still hides among about 4.5 real people on average, and if
-half the voters change group once, that grows to about 30.
+Some numbers. With 1{,}000 voters in groups of 8, all ballots together take
+16.5 megabytes and about one second to check on a normal computer; in one
+big crowd, two gigabytes and two and a half minutes. If an attacker
+registers half of all voters as fake people, a voter in a group of 8 still
+hides among about 4.5 real people on average, and if half the voters change
+group once, that grows to about 30.
 
-\paragraph{Mistakes we found.} Our 2021 prototype had a bug that made
-the envelope see-through: anyone could work out who signed. Nothing in
-the demo showed it, because the ballots still checked out as valid. A
-later rewrite had a different bug: copying two honest ballots from the
-public record was enough to cancel both votes and blame an innocent
-voter. Both are fixed and tested.
+\paragraph{Mistakes we found.} Our 2021 prototype had a bug that made the
+envelope see-through: anyone could work out who signed. Nothing in the
+demo showed it, because the ballots still checked out as valid. And the
+paper the new signature comes from has the fake-box hole described above.
+Both are fixed and tested.
 
 % ===========================================================================
 \section{What this project did \emph{not} fix}
 % ===========================================================================
 
-It's important to be honest about what we did not solve. These are
-real, hard, open problems --- not ones a small project can knock out.
-
 \begin{itemize}[leftmargin=*]
-
-  \item \textbf{Coercion.} If someone threatens you and says ``vote
-        for pasta or I'll fire you,'' you might want to prove to them
-        that you obeyed. With our system, you actually \emph{can}
-        prove it (by revealing your seal-recipe), so a coercer can
-        force you to comply. Fixing this is called
-        \emph{coercion resistance} and requires significantly more
-        machinery (a 2005 paper called JCJ is the canonical
-        starting point). It is one of the most active open problems
-        in voting research.
-
-  \item \textbf{Compromised computers.} If a virus on your laptop
-        secretly signs whatever it wants, the cryptography can't
-        help you --- the system can't tell the difference between
-        ``Alice clicked pasta'' and ``Alice's malware clicked
-        pasta.'' Real deployments need hardware (smart cards, HSMs)
-        and that is a different engineering project.
-
-  \item \textbf{Quantum computers.} The math we rely on can be
-        broken by a sufficiently large quantum computer (the
-        algorithm is called Shor's). Those computers don't exist
-        yet at scale, but if they do, our system will need to be
-        re-built on top of different mathematics
-        (``post-quantum cryptography'').
-
-  \item \textbf{Small groups leak.} Groups keep ballots small, but the
-        result is visible per group: if all 8 people in a group voted
-        pasta, everyone knows how each of them voted. Fake voters also
-        shrink the real crowd you hide in.
-
-  \item \textbf{The group shuffle is not perfectly fair.} Whoever
-        builds the block whose fingerprint shuffles the groups could
-        throw it away and try again. It costs them a block reward
-        every time, but it is possible.
-
+  \item \textbf{Coercion.} If someone threatens you (``vote pasta or
+        else''), you could prove you obeyed by showing them your secret
+        key. Fixing this is called \emph{coercion resistance}, and it needs
+        much more machinery.
+  \item \textbf{Compromised computers.} If a virus on your laptop signs
+        whatever it wants, no cryptography can tell.
+  \item \textbf{Small groups leak.} The result is visible per group: if all
+        8 people in a group voted pasta, everyone knows how each of them
+        voted. Fake voters also shrink the real crowd you hide in.
+  \item \textbf{The group shuffle is not perfectly fair.} Whoever builds
+        the block whose fingerprint shuffles the groups could throw it away
+        and try again, at the cost of a block reward each time.
   \item \textbf{Keys you moved to cannot be fined.} A new key has no
-        deposit behind it (attaching one would reveal where it came
-        from), so if it signs twice its votes are thrown away but
-        nobody pays.
-
-  \item \textbf{Truly proving the cryptography.} The math is correct
-        in the paper that proposed it, but our specific Python
-        implementation has not been independently audited or
-        machine-checked using formal-verification tools like
-        EasyCrypt. A machine-checked proof would be a research
-        contribution in its own right.
-
+        deposit behind it (attaching one would reveal where it came from),
+        so if it signs twice its votes are thrown away but nobody pays.
+  \item \textbf{Big ballots.} 16 kilobytes for a group of 8 is fine; much
+        bigger groups get expensive.
+  \item \textbf{Proofs.} The paper proves its signature secure against
+        ordinary computers; a proof against quantum computers is still an
+        open question, and our code has not been independently audited.
 \end{itemize}
 
 % ===========================================================================
 \section{How this connects to things you may have heard of}
 % ===========================================================================
 
-\paragraph{Bitcoin.} Bitcoin invented the proof-of-work chain we used
-for Option~B. The difference is what is stored on the chain ---
-Bitcoin stores money transfers, we store election records --- and
-what we use it for. Most relevant to read first: Wikipedia on
-``proof of work,'' then Nakamoto's 2008 Bitcoin whitepaper if you
-want the original.
+\paragraph{Bitcoin} invented the proof-of-work chain we use. Bitcoin stores
+money transfers; we store poll records, and use the money for deposits.
 
-\paragraph{Certificate Transparency.} When your browser visits a
-website, the website shows a certificate proving it owns the domain.
-Certificate Transparency is a system of public bulletin boards that
-record every certificate ever issued, so if a bad certificate
-authority secretly issues a fake certificate for, say,
-\texttt{gmail.com}, it gets logged publicly and the attack is
-visible. Option~A in our project is the same idea, transplanted to
-voting.
+\paragraph{Post-quantum cryptography} is cryptography designed to survive
+quantum computers. Our signature belongs to its simplest family: schemes
+built only from hash functions.
 
-\paragraph{Voting research.} Two systems you might run into:
-Helios (2008) is one of the earliest practical end-to-end-verifiable
-voting systems. ElectionGuard (Microsoft, 2021) is more recent. Our
-project sits in the same family but uses a different building block
-(ring signatures) and is much smaller in scope.
+\paragraph{Voting research.} Helios (2008) and ElectionGuard (2021) are
+well-known verifiable voting systems. Ours sits in the same family but uses
+a different building block and is much smaller in scope.
 
 % ===========================================================================
 \section{Glossary}
 % ===========================================================================
 
 \begin{description}[leftmargin=1.2em, style=nextline, font=\bfseries]
-  \item[Anonymity set] The crowd you are hiding inside. In our case,
-        your group (or, after changing group, all the groups your new
-        group-mates came from).
+  \item[Anonymity set] The crowd you are hiding inside: your group, or after
+        changing group, all the groups your new group-mates came from.
   \item[Ballot] A single voter's signed choice.
-  \item[Bulletin board] The append-only public record where every
-        election event is written. ``Append-only'' means new entries
-        can be added but old entries cannot be edited or removed.
-  \item[Deposit] eVotes locked when you register, returned after the
-        election unless you signed twice.
-  \item[Election ID] A unique label for one specific election. The
-        seal mentioned in the wax-seal analogy depends on it, which
-        is why a voter's seal looks different in different elections.
-  \item[Group] The small crowd you sign in, shuffled by a block
-        fingerprint nobody could predict at registration time.
-  \item[Hash] A short fingerprint of a longer piece of data.
-        ``SHA-256'' is the most common one. Changing even one bit of
-        the input changes the fingerprint completely.
-  \item[Mining] In Option~B, the activity of guessing nonces until
-        the puzzle is solved. The reward for finding a good nonce is
-        paid in eVotes.
-  \item[Public-key cryptography] Math where you have a public ``lock''
-        anyone can use to send you encrypted messages or verify your
-        signatures, and a private ``key'' only you know that you use
-        to read messages or produce signatures. The web's HTTPS
-        padlock relies on this.
-  \item[Ring signature] A signature that proves \emph{one of these
-        $n$ people} signed it, without revealing which one.
-  \item[Trace tag (``seal'' in this document)] The mathematical
-        object that's the same every time a given voter signs in a
-        given election. Collisions reveal a double-voter.
+  \item[Blockchain] A public list of blocks, each pointing to the one
+        before, that anyone can check and nobody can quietly edit.
+  \item[Deposit] eVotes locked when you register, returned after the poll
+        unless your key signed twice.
+  \item[Group] The small crowd you sign in, shuffled by a block fingerprint
+        nobody could predict at registration time.
+  \item[Hash (``lottery machine'')] A short fingerprint of data. Change one
+        bit of the input and the output changes completely.
+  \item[Key label] A tag inside a key that says which poll and which voter
+        name it was made for.
+  \item[One-time] Each key signs once, ever.
+  \item[Proof of work] The guessing puzzle that decides who adds the next
+        block.
+  \item[Ring signature] A signature that proves \emph{one of these people}
+        signed it, without revealing which one.
+  \item[Trick box] Our picture for one row of a public key: its owner can
+        open it either way, and showing both ways reveals the owner.
 \end{description}
 
 % ===========================================================================
 \section*{What to read next}
 % ===========================================================================
 
-If you want the technical version of the same material, with the
-actual mathematics, read \texttt{notes.tex} in this same folder
-(24~pages). It walks through the same ideas with formulas, code
-snippets, and a chapter on why the chain version is harder than it
-looks.
-
-If you want to skip the implementation details and read the
-research-style write-up, read \texttt{paper/artifact.tex} (13~pages).
-It is structured like a small academic paper.
-
-If you want to read the code, the easiest starting point is
-\texttt{trs/trs.py} (the magic envelope), then \texttt{chain/state.py}
-(deposits, groups, changing group), then \texttt{tests/test\_chain.py}.
+If you want the same material with the actual mathematics, read
+\texttt{notes.tex} in this folder. If you want the research write-up, read
+\texttt{paper/artifact.tex}. If you want to read the code, start with
+\texttt{otrs/scheme.py} (the trick boxes), then \texttt{chain/state.py}
+(deposits, groups, changing group), then \texttt{tests/test\_otrs.py}.
 
 \end{document}

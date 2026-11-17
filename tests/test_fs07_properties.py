@@ -2,9 +2,9 @@
 
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from trs import keygen, sign, trace, verify
-from trs.group import ORDER, Scalar, base_mul
-from trs.trs import PublicKey
+from fs07 import keygen, sign, trace, verify
+from fs07.group import ORDER, Scalar, base_mul
+from fs07.scheme import PublicKey
 
 
 @st.composite

@@ -2,9 +2,9 @@
 
 import pytest
 
-from trs.group import Scalar, base_mul
-from trs.trs import PublicKey
-from trs.serialize import decode_signature, encode_ring, encode_signature
+from fs07.group import Scalar, base_mul
+from fs07.scheme import PublicKey
+from fs07.serialize import decode_signature, encode_ring, encode_signature
 
 
 class TestEncodeRing:

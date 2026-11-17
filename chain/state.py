@@ -7,12 +7,14 @@ either succeeds and mutates the state in place, or raises
 
 This is where the e-ring-voting design lives (see ``paper/artifact.tex``):
 
+* **One key, one use.** Voters sign with one-time traceable ring
+  signatures (Scafuro–Zhang, :mod:`otrs`). A key that signs a second time,
+  whatever it signs, is exposed by the trace.
 * **Deterrence, not just detection.** Registering a voter locks
-  ``setup.deposit`` eVotes from the sponsor. A registered key that signs
-  two different messages under the same tag is exposed by the FS07 trace
-  rule; at the end of the poll its deposit is *burned* (a forfeit: it goes
-  to nobody, so no miner profits from including the evidence) and every
-  other deposit is refunded.
+  ``setup.deposit`` eVotes from the sponsor. At the end of the poll the
+  deposit of every registered key that was traced is *burned* (a forfeit:
+  it goes to nobody, so no miner profits from including the evidence) and
+  every other deposit is refunded.
 * **Groups nobody chooses.** Ring signatures are O(n), so voters sign
   inside groups of at least ``setup.group_size`` members, assigned from a
   beacon (the hash of the block preceding the freeze), see
@@ -37,18 +39,20 @@ Block-level rules
 Transaction-level rules
 -----------------------
 * Transfers: signed by sender, nonce matches account, sufficient balance.
-* Poll setup and voter registration are signed by the creator / sponsor;
-  registration carries the voter's proof of possession.
+* Poll setup and voter registration are signed by the creator / sponsor.
+  A registered key must carry the label of this poll and the voter's
+  handle (:meth:`~voting.records.VoterRegistration.key_label`), and a
+  key received by transfer the label of this poll and the round it enters.
 * Ballots and key transfers are unsigned at the chain layer — anonymity
-  preserved. The TRS signature inside the payload is what proves validity.
-  A message linked to one already recorded (a replay) is invalid, and so is
-  any further message from a signer already exposed, so a double-signer can
-  add at most one extra message to the chain.
+  preserved. The ring signature inside the payload is what proves
+  validity. A copy of a recorded signature (a replay) is invalid, and so
+  is a signature that only traces keys already exposed, so each key adds
+  at most one piece of evidence to the chain.
 """
 
 from __future__ import annotations
 
-from base64 import b64decode, b64encode
+from base64 import b64decode
 from dataclasses import dataclass, field, replace
 from statistics import median
 from typing import Dict, List, Optional, Set, Tuple
@@ -60,8 +64,8 @@ from chain.transactions import (
     TxKind,
     verify_tx_sig,
 )
-from trs import PublicKey, Signature, verify as trs_verify, verify_possession
-from voting.groups import assign_groups, issue_for
+from otrs import PublicKey, Ring, Signature, params_for
+from voting.groups import assign_groups, issue_for, signing_context
 from voting.records import (
     Ballot,
     ElectionSetup,
@@ -144,7 +148,7 @@ class RoundState:
     """One voting round: its groups and the messages signed in each group."""
 
     beacon: bytes
-    groups: List[List[PublicKey]]
+    groups: List[Ring]
     books: List[TagBook]
 
     def copy(self) -> "RoundState":
@@ -160,7 +164,8 @@ class PollResult:
     """Computed by the chain itself at the first block past ``voting_close``."""
 
     tally: Dict[str, int]
-    culprits: List[Tuple[int, str]]   # (round, pk_b64) of exposed double-signers
+    # (round, key fingerprint hex, registration handle or "") of traced keys
+    culprits: List[Tuple[int, str, str]]
     slashed: int                      # eVotes burned (round-0 culprits' deposits)
     refunded: int                     # eVotes returned to sponsors
     transfers: List[int]              # accepted key transfers, per round
@@ -173,10 +178,12 @@ class PollState:
     setup: ElectionSetup
     phase: str  # "registration" | "voting" | "closed" | "aborted"
     registrations: List[VoterRegistration] = field(default_factory=list)
-    # voter_pk_b64 -> (sponsor_pk_b64, locked amount)
-    escrow: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+    # key fingerprint -> (sponsor_pk_b64, locked amount)
+    escrow: Dict[bytes, Tuple[str, int]] = field(default_factory=dict)
+    # key fingerprint -> registration handle (registered keys only)
+    handles: Dict[bytes, str] = field(default_factory=dict)
     # every key that is or will be a member of some round (no key twice)
-    known_keys: Set[bytes] = field(default_factory=set)
+    keys: Dict[bytes, PublicKey] = field(default_factory=dict)
     rounds: List[RoundState] = field(default_factory=list)
     result: Optional[PollResult] = None
 
@@ -189,7 +196,8 @@ class PollState:
             self,
             registrations=list(self.registrations),
             escrow=dict(self.escrow),
-            known_keys=set(self.known_keys),
+            handles=dict(self.handles),
+            keys=dict(self.keys),
             rounds=[r.copy() for r in self.rounds],
         )
 
@@ -264,34 +272,35 @@ def round_at(setup: ElectionSetup, timestamp: int) -> int:
 
 
 def _open_round(poll: PollState, members: List[bytes], beacon: bytes) -> None:
+    """Open the next round for ``members`` (key fingerprints)."""
     r = len(poll.rounds)
     issue = issue_for(poll.election_id, r)
     groups_raw = assign_groups(members, poll.setup.group_size, beacon, issue)
-    groups = [[PublicKey.from_bytes(pk) for pk in g] for g in groups_raw]
+    rings = [Ring([poll.keys[fp] for fp in g]) for g in groups_raw]
     poll.rounds.append(
         RoundState(
             beacon=beacon,
-            groups=groups,
-            books=[TagBook(issue=issue, ring=g) for g in groups],
+            groups=rings,
+            books=[TagBook(ring=ring) for ring in rings],
         )
     )
 
 
 def _transferred_keys(rnd: RoundState) -> List[bytes]:
-    """New keys from this round's transfers whose signer did not double-sign."""
+    """Fingerprints of the new keys of this round's untraced transfers."""
     out: List[bytes] = []
     for book in rnd.books:
         for i in book.classify().accepted:
             record = book.refs[i]
             if isinstance(record, KeyTransfer):
-                out.append(b64decode(record.new_pk_b64))
+                out.append(PublicKey.from_bytes(b64decode(record.new_pk_b64)).fingerprint)
     return out
 
 
-def _settle(state: State, poll: PollState, slashed_keys: Set[str]) -> Tuple[int, int]:
+def _settle(state: State, poll: PollState, slashed_keys: Set[bytes]) -> Tuple[int, int]:
     slashed = refunded = 0
-    for voter_b64, (sponsor_b64, amount) in sorted(poll.escrow.items()):
-        if voter_b64 in slashed_keys:
+    for fp, (sponsor_b64, amount) in sorted(poll.escrow.items()):
+        if fp in slashed_keys:
             slashed += amount
         else:
             state.credit(sponsor_b64, amount)
@@ -303,11 +312,12 @@ def _settle(state: State, poll: PollState, slashed_keys: Set[str]) -> Tuple[int,
 
 def _finalize(state: State, poll: PollState) -> None:
     tally = {opt: 0 for opt in poll.setup.options}
-    culprits: List[Tuple[int, str]] = []
+    culprits: List[Tuple[int, str, str]] = []
+    slashed_keys: Set[bytes] = set()
     transfers: List[int] = []
     for r, rnd in enumerate(poll.rounds):
         moved = 0
-        for group, book in zip(rnd.groups, rnd.books):
+        for ring, book in zip(rnd.groups, rnd.books):
             verdict = book.classify()
             for i in verdict.accepted:
                 record = book.refs[i]
@@ -315,14 +325,16 @@ def _finalize(state: State, poll: PollState) -> None:
                     tally[record.choice] += 1
                 else:
                     moved += 1
-            culprits.extend(
-                (r, b64encode(group[j].point.raw).decode()) for j in verdict.culprits
-            )
+            for j in verdict.culprits:
+                fp = ring.keys[j].fingerprint
+                culprits.append((r, fp.hex(), poll.handles.get(fp, "")))
+                if r == 0:
+                    slashed_keys.add(fp)
         transfers.append(moved)
     # Only registered (round-0) keys have a deposit behind them. A key that
     # arrived by transfer is anonymous: its double-sign voids its messages
     # but there is no identity, hence no deposit, to slash.
-    slashed, refunded = _settle(state, poll, {pk for r, pk in culprits if r == 0})
+    slashed, refunded = _settle(state, poll, slashed_keys)
     poll.result = PollResult(
         tally=tally,
         culprits=culprits,
@@ -336,7 +348,7 @@ def _finalize(state: State, poll: PollState) -> None:
 def _advance_poll(state: State, poll: PollState, timestamp: int, beacon: bytes) -> None:
     setup = poll.setup
     if poll.phase == "registration" and timestamp >= setup.voting_open:
-        members = [b64decode(r.voter_pk_b64) for r in poll.registrations]
+        members = list(poll.handles)
         if len(members) < 2:
             _settle(state, poll, set())
             poll.phase = "aborted"
@@ -504,26 +516,31 @@ def _apply_register_voter(
         raise StateError(f"registration_payload invalid: {exc}") from exc
     if not isinstance(record, VoterRegistration):
         raise StateError("registration_payload must contain VoterRegistration")
-    pk_raw = b64decode(record.voter_pk_b64)
-    if len(pk_raw) != 32:
-        raise StateError("voter_pk_b64 must decode to 32 bytes")
-    try:
-        voter_pk = PublicKey.from_bytes(pk_raw)
-    except ValueError as exc:
-        raise StateError(f"voter_pk is not a valid Ristretto255 point: {exc}") from exc
-    if pk_raw in poll.known_keys:
+    voter_pk = _parse_key(record.voter_pk_b64, poll)
+    if voter_pk.label != VoterRegistration.key_label(election_id, record.voter_handle):
+        raise StateError("voter key was not made for this poll and handle")
+    fp = voter_pk.fingerprint
+    if fp in poll.keys:
         raise StateError("voter already registered")
-    context = VoterRegistration.pop_context(election_id, record.voter_handle)
-    if not verify_possession(voter_pk, context, b64decode(record.pop_sig_b64)):
-        raise StateError("registration lacks a valid proof of possession")
     poll.registrations.append(record)
-    poll.known_keys.add(pk_raw)
-    poll.escrow[record.voter_pk_b64] = (sponsor_b64, deposit)
+    poll.keys[fp] = voter_pk
+    poll.handles[fp] = record.voter_handle
+    poll.escrow[fp] = (sponsor_b64, deposit)
     return fee
 
 
+def _parse_key(pk_b64: str, poll: PollState) -> PublicKey:
+    try:
+        pk = PublicKey.from_bytes(b64decode(pk_b64))
+    except (ValueError, TypeError) as exc:
+        raise StateError(f"invalid OTRS public key: {exc}") from exc
+    if pk.params != params_for(poll.setup.security):
+        raise StateError(f"key does not use the poll's λ = {poll.setup.security}")
+    return pk
+
+
 def _apply_anonymous(state: State, tx: Transaction) -> None:
-    """A ballot or a key transfer: no sender, no fee; the TRS signature rules."""
+    """A ballot or a key transfer: no sender, no fee; the ring signature rules."""
     body = tx.body
     try:
         election_id = str(body["election_id"])
@@ -550,7 +567,7 @@ def _apply_anonymous(state: State, tx: Transaction) -> None:
     if not 0 <= record.group < len(rnd.groups):
         raise StateError(f"no group {record.group} in round {record.round}")
 
-    new_pk_raw = b""
+    new_pk = None
     if isinstance(record, Ballot):
         if record.choice not in poll.setup.options:
             raise StateError(f"choice {record.choice!r} not in options")
@@ -558,27 +575,26 @@ def _apply_anonymous(state: State, tx: Transaction) -> None:
     else:
         if record.round >= poll.setup.rounds - 1:
             raise StateError("no key transfers in the last round")
-        new_pk_raw = b64decode(record.new_pk_b64)
-        try:
-            PublicKey.from_bytes(new_pk_raw)
-        except ValueError as exc:
-            raise StateError(f"new_pk is not a valid Ristretto255 point: {exc}") from exc
-        if new_pk_raw in poll.known_keys:
+        new_pk = _parse_key(record.new_pk_b64, poll)
+        if new_pk.label != KeyTransfer.key_label(election_id, record.round + 1):
+            raise StateError("key transfer target was not made for the next round")
+        if new_pk.fingerprint in poll.keys:
             raise StateError("key transfer target is already a member of this poll")
-        message = KeyTransfer.message_for(new_pk_raw)
+        message = KeyTransfer.message_for(new_pk.to_bytes())
 
     try:
-        sig = Signature.from_bytes(b64decode(record.trs_sig_b64))
-    except (ValueError, Exception) as exc:  # noqa: BLE001
-        raise StateError(f"malformed TRS signature: {exc}") from exc
-    issue = issue_for(election_id, record.round)
-    if not trs_verify(sig, issue, message, rnd.groups[record.group]):
-        raise StateError("TRS signature does not verify against the group")
-    outcome = rnd.books[record.group].admit(message, sig, ref=record)
+        sig = Signature.from_bytes(b64decode(record.sig_b64))
+    except (ValueError, TypeError) as exc:
+        raise StateError(f"malformed ring signature: {exc}") from exc
+    ring = rnd.groups[record.group]
+    openings = ring.check(sig, message, signing_context(election_id, record.round))
+    if openings is None:
+        raise StateError("ring signature does not verify against the group")
+    outcome = rnd.books[record.group].admit(message, sig, openings, ref=record)
     if outcome not in (FRESH, EVIDENCE):
         raise StateError(f"{tx.kind} rejected: {outcome}")
-    if new_pk_raw:
-        poll.known_keys.add(new_pk_raw)
+    if new_pk is not None:
+        poll.keys[new_pk.fingerprint] = new_pk
 
 
 # --------------------------------------------------------------------------- #

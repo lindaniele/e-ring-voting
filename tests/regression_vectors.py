@@ -1,7 +1,7 @@
 """
 Pinned regression vectors. Populated on the first successful test run via
 ``scripts/freeze_vectors.py``. The point of these is to catch silent regressions
-in the hash-to-curve pipeline; they do not by themselves prove RFC 9380
+in the FS07 hash-to-curve pipeline; they do not by themselves prove RFC 9380
 compliance (cross-validation against RFC 9380 §K vectors is on the backlog).
 """
 

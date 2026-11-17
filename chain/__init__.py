@@ -2,11 +2,11 @@
 chain — the e-ring-voting proof-of-work chain.
 
 The chain carries an eVote ledger and runs polls whose rules realise the
-original e-ring-voting design: traceable ring signatures (:mod:`trs`) for
-anonymous ballots, deposits burned when a registered key double-signs,
-beacon-assigned fixed-size groups, and key transfers between rounds. The
-typed records are shared with :mod:`voting`, whose federated bulletin board
-serves as the permissioned baseline the paper compares against.
+original e-ring-voting design: one-time traceable ring signatures
+(Scafuro–Zhang, :mod:`otrs`) for anonymous ballots, deposits burned when a
+registered key is used twice, beacon-assigned fixed-size groups, and key
+transfers between rounds. The poll records and the trace bookkeeping live
+in :mod:`voting`.
 """
 
 from chain.block import Block, BlockHeader, make_genesis, verify_pow

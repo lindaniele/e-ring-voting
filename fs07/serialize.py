@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Sequence
 
-from trs.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
+from fs07.group import POINT_BYTES, SCALAR_BYTES, Point, Scalar
 
 LENGTH_PREFIX_BYTES = 4
 MAX_RING_SIZE = 65535  # generous; the scheme itself has no protocol-level cap

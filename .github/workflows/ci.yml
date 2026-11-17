@@ -19,7 +19,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: System dependencies (libsodium)
+      - name: System dependencies (libsodium, for the FS07 comparison only)
         run: sudo apt-get update && sudo apt-get install -y libsodium23
       - name: Install
         run: |
@@ -29,6 +29,6 @@ jobs:
         run: python -m pytest -v --tb=short
       - name: Quick benchmark (smoke)
         run: |
-          python -m bench.bench_trs --sizes 2,4,8 --repeats 2
+          python -m bench.bench_primitives --sizes 2,8 --repeats 2
           python -m bench.bench_chain --voters 5 --group-size 2 --difficulty 4
           python -m bench.bench_groups --cost --anonymity --voters 200 --sizes 4,8 --trials 2 --probe 2,4,8

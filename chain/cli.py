@@ -15,7 +15,6 @@ Quickstart::
 
     python3 -m chain.cli account-keygen --out alice.json
     python3 -m chain.cli account-keygen --out miner.json
-    python3 -m chain.cli voter-keygen   --out v0.json
 
     python3 -m chain.cli init-chain --chain chain.bin --miner miner.json \\
         --allocate $(jq -r .pk_b64 alice.json):1000
@@ -23,15 +22,17 @@ Quickstart::
     python3 -m chain.cli setup-poll --chain chain.bin --miner miner.json \\
         --creator alice.json --title "Demo" --options "yes,no" \\
         --registration-close T0 --voting-open T1 --voting-close T2 \\
-        --group-size 3 --rounds 2 --deposit 10
+        --group-size 3 --rounds 2 --deposit 10          # prints <id>
 
+    # A one-time key is made for one poll and one handle.
+    python3 -m chain.cli voter-keygen --election-id <id> --handle v0 --out v0.json
     python3 -m chain.cli register-voter --chain chain.bin --miner miner.json \\
-        --sponsor alice.json --election-id <id> --voter v0.json --handle v0
+        --sponsor alice.json --election-id <id> --voter v0.json
 
     python3 -m chain.cli vote --chain chain.bin --miner miner.json \\
         --voter v0.json --election-id <id> --choice yes
     python3 -m chain.cli transfer --chain chain.bin --miner miner.json \\
-        --voter v1.json --new-voter v1b.json --election-id <id>
+        --voter v1.json --election-id <id> --out v1b.json
 
     python3 -m chain.cli mine-empty --chain chain.bin --miner miner.json \\
         --timestamp T2
@@ -52,15 +53,19 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
 from chain.auditor import audit_chain
-from chain.client import ballot_tx, key_transfer_tx, registration_tx
+from chain.client import (
+    ballot_tx,
+    key_transfer_tx,
+    registration_tx,
+    transfer_key,
+    voter_key,
+)
 from chain.mining import mine_block, next_difficulty
 from chain.node import Node, make_genesis_node
 from chain.state import ChainParams, DEFAULT_PARAMS, StateError, state_for_next_block
 from chain.transactions import Transaction, make_coinbase, make_setup_poll
-from trs import KeyPair, keygen as trs_keygen
-from trs.group import Scalar
-from trs.trs import PublicKey as TrsPublicKey, SecretKey as TrsSecretKey
-from voting.records import ElectionSetup
+from otrs import KeyPair, SecretKey
+from voting.records import ElectionSetup, VoterRegistration
 
 
 # --------------------------------------------------------------------------- #
@@ -94,18 +99,20 @@ def _save_account(path: Path, sk: ed25519.Ed25519PrivateKey) -> None:
     }, indent=2))
 
 
-def _load_voter(path: Path) -> KeyPair:
+def _load_voter(path: Path) -> Tuple[KeyPair, dict]:
     blob = json.loads(path.read_text())
-    pk = TrsPublicKey.from_bytes(b64decode(blob["pk_b64"]))
-    sk = TrsSecretKey(Scalar(b64decode(blob["sk_b64"])))
-    return KeyPair(sk=sk, pk=pk)
+    sk = SecretKey.from_bytes(b64decode(blob["sk_b64"]))
+    return KeyPair(sk=sk, pk=sk.public_key()), blob
 
 
-def _save_voter(path: Path, kp: KeyPair) -> None:
+def _save_voter(path: Path, kp: KeyPair, **meta) -> None:
+    # The public key (6 KB at λ = 128) is derived from the secret on load.
     path.write_text(json.dumps({
-        "kind": "trs",
-        "pk_b64": b64encode(kp.pk.point.raw).decode(),
-        "sk_b64": b64encode(kp.sk.x.raw).decode(),
+        "kind": "otrs",
+        "security": kp.pk.params.lam,
+        "fingerprint": kp.pk.fingerprint.hex(),
+        "sk_b64": b64encode(kp.sk.to_bytes()).decode(),
+        **meta,
     }, indent=2))
 
 
@@ -164,9 +171,9 @@ def cmd_account_keygen(args: argparse.Namespace) -> None:
 
 
 def cmd_voter_keygen(args: argparse.Namespace) -> None:
-    kp = trs_keygen()
-    _save_voter(Path(args.out), kp)
-    print(b64encode(kp.pk.point.raw).decode())
+    kp = voter_key(args.election_id, args.handle, security=args.security)
+    _save_voter(Path(args.out), kp, election_id=args.election_id, handle=args.handle)
+    print(kp.pk.fingerprint.hex())
 
 
 def cmd_init_chain(args: argparse.Namespace) -> None:
@@ -213,13 +220,10 @@ def cmd_setup_poll(args: argparse.Namespace) -> None:
         registration_close=args.registration_close,
         voting_open=args.voting_open,
         voting_close=args.voting_close,
-        # On the chain, the "cohort" degenerates to the single poll creator;
-        # we still populate the field for record-format compatibility.
-        cohort_pks_b64=[b64encode(creator_pk_raw).decode()],
-        threshold=1,
         group_size=args.group_size,
         rounds=args.rounds,
         deposit=args.deposit,
+        security=args.security,
     )
     setup.validate()
     creator_b64 = b64encode(creator_pk_raw).decode()
@@ -243,12 +247,18 @@ def cmd_register_voter(args: argparse.Namespace) -> None:
     poll = node.state.polls.get(args.election_id)
     if poll is None:
         sys.exit(f"unknown election_id {args.election_id!r}")
+    voter, meta = _load_voter(Path(args.voter))
+    handle = args.handle or meta.get("handle")
+    if not handle:
+        sys.exit("no handle: pass --handle or use a key made by voter-keygen")
+    if voter.pk.label != VoterRegistration.key_label(args.election_id, handle):
+        sys.exit("this key was not made for this poll and handle")
     tx = registration_tx(
         sponsor_pk_raw=sponsor_pk_raw,
         sponsor_sk=sponsor_sk,
         election_id=args.election_id,
-        voter=_load_voter(Path(args.voter)),
-        handle=args.handle,
+        voter_pk=voter.pk,
+        handle=handle,
         fee=args.fee,
         deposit=poll.setup.deposit,
         nonce=node.state.nonce(b64encode(sponsor_pk_raw).decode()),
@@ -256,7 +266,7 @@ def cmd_register_voter(args: argparse.Namespace) -> None:
     _mine(node, miner_pk_raw, [tx], fees=args.fee,
           timestamp=_block_timestamp(node, args.timestamp))
     node.save(Path(args.chain))
-    print(f"registered voter {args.handle} (deposit {poll.setup.deposit} locked)")
+    print(f"registered voter {handle} (deposit {poll.setup.deposit} locked)")
 
 
 def _poll_for_next_block(node: Node, election_id: str, timestamp: int):
@@ -274,7 +284,7 @@ def cmd_vote(args: argparse.Namespace) -> None:
     if args.choice not in poll.setup.options:
         sys.exit(f"choice {args.choice!r} not in options {poll.setup.options}")
     try:
-        tx = ballot_tx(poll, _load_voter(Path(args.voter)), args.choice)
+        tx = ballot_tx(poll, _load_voter(Path(args.voter))[0], args.choice)
     except ValueError as exc:
         sys.exit(str(exc))
     _mine(node, miner_pk_raw, [tx], fees=0, timestamp=timestamp)
@@ -287,14 +297,18 @@ def cmd_transfer(args: argparse.Namespace) -> None:
     miner_pk_raw, _ = _load_account(Path(args.miner))
     timestamp = _block_timestamp(node, args.timestamp)
     poll = _poll_for_next_block(node, args.election_id, timestamp)
-    new_voter = _load_voter(Path(args.new_voter))
+    if poll.phase != "voting":
+        sys.exit(f"poll is not open for voting (phase {poll.phase!r})")
+    nxt = poll.current_round + 1
+    new_voter = transfer_key(args.election_id, nxt, security=poll.setup.security)
     try:
-        tx = key_transfer_tx(poll, _load_voter(Path(args.voter)), new_voter.pk)
+        tx = key_transfer_tx(poll, _load_voter(Path(args.voter))[0], new_voter.pk)
     except ValueError as exc:
         sys.exit(str(exc))
     _mine(node, miner_pk_raw, [tx], fees=0, timestamp=timestamp)
     node.save(Path(args.chain))
-    print(f"voting right moved to a new key for round {poll.current_round + 1}")
+    _save_voter(Path(args.out), new_voter, election_id=args.election_id, round=nxt)
+    print(f"voting right moved to a new key for round {nxt}, saved to {args.out}")
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
@@ -313,8 +327,9 @@ def cmd_audit(args: argparse.Namespace) -> None:
             continue
         print(f"  tally: {dict(sorted(poll.tally.items()))}")
         print(f"  key transfers per round: {poll.transfers}")
-        for r, pk_b64 in poll.culprits:
-            print(f"  double-signer in round {r}: {pk_b64}")
+        for r, fp, handle in poll.culprits:
+            who = f"handle {handle!r}" if handle else "a transferred key"
+            print(f"  key used twice in round {r}: {who} (key {fp[:16]}…)")
         print(f"  deposits: {poll.slashed} burned, {poll.refunded} refunded")
 
 
@@ -373,8 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", required=True)
     sp.set_defaults(func=cmd_account_keygen)
 
-    sp = sub.add_parser("voter-keygen")
+    sp = sub.add_parser("voter-keygen", help="make a one-time key for one poll and handle")
     sp.add_argument("--out", required=True)
+    sp.add_argument("--election-id", required=True)
+    sp.add_argument("--handle", required=True)
+    sp.add_argument("--security", type=int, default=128, help="OTRS λ: 128 or 256")
     sp.set_defaults(func=cmd_voter_keygen)
 
     sp = sub.add_parser("init-chain")
@@ -401,6 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--group-size", type=int, default=0, help="0 = one ring for all")
     sp.add_argument("--rounds", type=int, default=1, help=">1 enables key transfers")
     sp.add_argument("--deposit", type=int, default=0, help="eVotes locked per voter")
+    sp.add_argument("--security", type=int, default=128, help="OTRS λ: 128 or 256")
     sp.add_argument("--election-id", default=None)
     sp.add_argument("--fee", type=int, default=DEFAULT_PARAMS.setup_fee)
     sp.set_defaults(func=cmd_setup_poll)
@@ -409,8 +428,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_chain(sp)
     sp.add_argument("--sponsor", required=True, help="account paying fee + deposit")
     sp.add_argument("--election-id", required=True)
-    sp.add_argument("--voter", required=True, help="voter key file (signs the proof of possession)")
-    sp.add_argument("--handle", required=True)
+    sp.add_argument("--voter", required=True, help="key file made by voter-keygen")
+    sp.add_argument("--handle", default=None, help="defaults to the key file's handle")
     sp.add_argument("--fee", type=int, default=DEFAULT_PARAMS.registration_fee)
     sp.set_defaults(func=cmd_register_voter)
 
@@ -424,7 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("transfer", help="move this round's voting right to a new key")
     add_chain(sp)
     sp.add_argument("--voter", required=True)
-    sp.add_argument("--new-voter", required=True, help="key file of the fresh key")
+    sp.add_argument("--out", required=True, help="where to save the fresh key")
     sp.add_argument("--election-id", required=True)
     sp.set_defaults(func=cmd_transfer)
 

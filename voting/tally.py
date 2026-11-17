@@ -1,178 +1,174 @@
 """
-Grouping signed messages by signer, following the FS07 trace rule.
+Classifying the messages signed inside one group, by OTRS trace.
 
-Every signature under a tag ``(issue, ring)`` carries one *column* per ring
-position, ``σ_j = A0 + j·A1``; column ``j`` equals ``h^{x_j}`` exactly when
-the signer sits at position ``j``. Two signatures by the same signer
-therefore share a column, and two signatures by different signers share
-none (except with negligible probability). FS07 then distinguishes:
+Scafuro–Zhang trace two *distinct* signatures made with the same key,
+whatever they sign and under whatever context. Inside a group of a round
+that gives three cases:
 
-* same message, every column shared → **linked**: one signer, one message.
-  A copy of a ballot replayed from the public log is the typical case. It
-  counts once and the signer stays anonymous.
-* different messages, a column shared → **double-sign**: the shared
-  column's position is the signer. Both messages are void and the key is
-  exposed.
+* a byte-identical copy of a recorded signature is a **replay**: anybody
+  can copy a ballot off the chain, and a copy is not a second use of the
+  key. It is refused and blames nobody. (Honest signing is deterministic,
+  so a voter who re-sends its ballot also produces a copy.)
+* a signature that traces against a recorded one is **evidence**: the
+  keys it traces to signed twice. Every message involved is void and the
+  keys are the group's *culprits*.
+* anything else is one use of one key: it counts.
 
-:class:`TagBook` keeps the messages of one tag indexed by column, so a
-validator can decide on arrival whether a message is new, a replay, or the
-evidence that exposes a double-signer, and an auditor can classify the
-whole book at the end. A component of messages connected by shared
-columns is one signer; the signer's position is only *known* if that
-signer double-signed.
+FS07, the scheme the 2021–22 prototype used, distinguishes a fourth case:
+two signatures by one key on the *same* message are only "linked" and the
+signer stays anonymous. Here there is no such case. Signing the same
+ballot twice with fresh randomness exposes the key like any double vote.
+
+:class:`TagBook` keeps every recorded signature's openings (``G(r)`` of
+every seed, computed anyway by verification), so admitting a signature
+costs one big-integer XOR per recorded signature and no hashing.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
-from trs import PublicKey, Signature
-from trs.group import Scalar
-from trs.hash import hash_to_group
-from trs.serialize import encode_ring
-from trs.trs import DST_H1
+from otrs import Openings, Ring, Signature
 
 # Admission outcomes of TagBook.admit().
-FRESH = "fresh"              # first message from this signer
-EVIDENCE = "double-sign"     # second, different message: exposes the signer
-REPLAY = "replay"            # same signer, same message as before
-SATURATED = "saturated"      # signer already exposed; nothing more to learn
-
-
-def sigma_columns(
-    issue: bytes, ring_bytes: bytes, message: bytes, sig: Signature
-) -> List[bytes]:
-    """The trace columns σ_1..σ_n of ``sig`` (encoded points)."""
-    A0 = hash_to_group(issue + ring_bytes + message, DST_H1)
-    return [
-        (A0 + sig.A1.scalar_mul(Scalar.from_int(j))).raw
-        for j in range(1, len(sig.c) + 1)
-    ]
+FRESH = "fresh"            # first use of a key: recorded, counts
+EVIDENCE = "evidence"      # second use of some key: recorded, exposes it
+REPLAY = "replay"          # byte-identical copy of a recorded signature
+SATURATED = "saturated"    # traces only keys already exposed: nothing to learn
+EXHAUSTED = "exhausted"    # would be the (N+1)-th untraced signature of N keys
 
 
 @dataclass(frozen=True)
 class Classification:
-    """Outcome of classifying a :class:`TagBook` (indices are book order)."""
+    """Outcome of classifying a group's messages (indices in input order)."""
 
-    accepted: List[int]       # one item per honest signer
-    linked: List[int]         # further copies of an accepted item
-    rejected: List[int]       # every item of a double-signer
-    culprits: List[int]       # 0-based ring positions of double-signers
+    accepted: List[int]       # untraced: one use of one key each
+    rejected: List[int]       # involved in a trace
+    culprits: List[int]       # ring positions of the keys traced
+    copies: List[int] = field(default_factory=list)  # duplicates of an earlier item
 
 
 @dataclass
 class TagBook:
-    """Signed messages under one tag ``(issue, ring)``, indexed by column."""
+    """The signed messages of one group in one round."""
 
-    issue: bytes
-    ring: List[PublicKey]
-    ring_bytes: bytes = b""
+    ring: Ring
     messages: List[bytes] = field(default_factory=list)
     refs: List[object] = field(default_factory=list)
-    _buckets: Dict[Tuple[int, bytes], List[int]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not self.ring_bytes:
-            self.ring_bytes = encode_ring([pk.point for pk in self.ring])
+    openings: List[Openings] = field(default_factory=list)
+    digests: Set[bytes] = field(default_factory=set)
+    traced: Set[int] = field(default_factory=set)     # record indices
+    culprits: Set[int] = field(default_factory=set)   # ring positions
 
     def copy(self) -> "TagBook":
         return TagBook(
-            issue=self.issue,
             ring=self.ring,
-            ring_bytes=self.ring_bytes,
             messages=list(self.messages),
             refs=list(self.refs),
-            _buckets={k: list(v) for k, v in self._buckets.items()},
+            openings=list(self.openings),
+            digests=set(self.digests),
+            traced=set(self.traced),
+            culprits=set(self.culprits),
         )
 
     def __len__(self) -> int:
         return len(self.messages)
 
-    def _same_signer(self, cols: Sequence[bytes]) -> List[int]:
-        found: set[int] = set()
-        for j, col in enumerate(cols):
-            found.update(self._buckets.get((j, col), ()))
-        return sorted(found)
+    def untraced(self) -> int:
+        return len(self.messages) - len(self.traced)
 
-    def admit(self, message: bytes, sig: Signature, ref: object = None) -> str:
+    def admit(
+        self,
+        message: bytes,
+        sig: Signature,
+        openings: Openings,
+        ref: object = None,
+    ) -> str:
         """
-        Record ``(message, sig)`` unless it adds nothing; return the outcome.
+        Record a verified ``(message, sig)`` unless it adds nothing.
 
-        The signature must already have been verified against this tag.
-        Replays and messages from an already exposed signer are *not*
-        recorded, which bounds every signer to at most two entries.
+        ``openings`` must be what :meth:`otrs.Ring.check` returned for
+        ``sig`` on this book's ring. Refused outcomes leave the book
+        unchanged. A group of ``N`` keys therefore holds at most ``N``
+        untraced signatures and at most ``N`` pieces of evidence.
         """
-        cols = sigma_columns(self.issue, self.ring_bytes, message, sig)
-        earlier = self._same_signer(cols)
-        if any(self.messages[i] == message for i in earlier):
+        digest = hashlib.sha256(sig.to_bytes()).digest()
+        if digest in self.digests:
             return REPLAY
-        if len(earlier) >= 2:
+        hits: List[int] = []
+        traced_keys: Set[int] = set()
+        for idx, other in enumerate(self.openings):
+            found = self.ring.culprits(openings, other)
+            if found:
+                hits.append(idx)
+                traced_keys.update(found)
+        if hits and traced_keys <= self.culprits:
             return SATURATED
-        self._record(message, cols, ref)
-        return EVIDENCE if earlier else FRESH
-
-    def _record(self, message: bytes, cols: Sequence[bytes], ref: object) -> None:
+        if not hits and self.untraced() >= len(self.ring):
+            # Public traceability says this cannot happen with honest keys.
+            return EXHAUSTED
         idx = len(self.messages)
         self.messages.append(message)
         self.refs.append(ref)
-        for j, col in enumerate(cols):
-            self._buckets.setdefault((j, col), []).append(idx)
+        self.openings.append(openings)
+        self.digests.add(digest)
+        if hits:
+            self.traced.update(hits)
+            self.traced.add(idx)
+            self.culprits.update(traced_keys)
+            return EVIDENCE
+        return FRESH
 
     def classify(self) -> Classification:
-        """Split the recorded messages into honest signers and double-signers."""
-        parent = list(range(len(self.messages)))
-
-        def find(i: int) -> int:
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
-        for members in self._buckets.values():
-            for other in members[1:]:
-                parent[find(other)] = find(members[0])
-
-        components: Dict[int, List[int]] = {}
-        for i in range(len(self.messages)):
-            components.setdefault(find(i), []).append(i)
-
-        accepted: List[int] = []
-        linked: List[int] = []
-        rejected: List[int] = []
-        for members in components.values():
-            if len({self.messages[i] for i in members}) == 1:
-                accepted.append(members[0])
-                linked.extend(members[1:])
-            else:
-                rejected.extend(members)
-        # A column shared by different messages is a double-signer's tag.
-        culprits = {
-            j
-            for (j, _), bucket in self._buckets.items()
-            if len({self.messages[i] for i in bucket}) > 1
-        }
+        rejected = sorted(self.traced)
+        accepted = [i for i in range(len(self.messages)) if i not in self.traced]
         return Classification(
-            accepted=sorted(accepted),
-            linked=sorted(linked),
-            rejected=sorted(rejected),
-            culprits=sorted(culprits),
+            accepted=accepted, rejected=rejected, culprits=sorted(self.culprits)
         )
 
 
 def classify_messages(
-    issue: bytes,
-    ring: Sequence[PublicKey],
+    ring: Ring,
     items: Sequence[Tuple[bytes, Signature]],
+    openings: Optional[Sequence[Openings]] = None,
 ) -> Classification:
     """
-    Classify a list of already verified ``(message, signature)`` pairs.
+    Classify already verified ``(message, signature)`` pairs of one group.
 
-    Unlike :meth:`TagBook.admit`, nothing is dropped: replays land in
-    ``linked`` and a double-signer's extra messages in ``rejected``, so the
-    returned indices refer to ``items`` one-to-one.
+    Unlike :meth:`TagBook.admit` nothing is dropped: copies land in
+    ``copies`` and every signature involved in a trace in ``rejected``, so
+    indices refer to ``items`` one to one.
     """
-    book = TagBook(issue=issue, ring=list(ring))
-    for message, sig in items:
-        book._record(message, sigma_columns(book.issue, book.ring_bytes, message, sig), None)
-    return book.classify()
+    if openings is None:
+        openings = [ring.openings(sig) for _, sig in items]
+    first: dict[bytes, int] = {}
+    copies: List[int] = []
+    distinct: List[int] = []
+    for i, (_, sig) in enumerate(items):
+        d = hashlib.sha256(sig.to_bytes()).digest()
+        if d in first:
+            copies.append(i)
+        else:
+            first[d] = i
+            distinct.append(i)
+    traced: Set[int] = set()
+    culprits: Set[int] = set()
+    for a_pos, a in enumerate(distinct):
+        for b in distinct[a_pos + 1:]:
+            found = ring.culprits(openings[a], openings[b])
+            if found:
+                traced.update((a, b))
+                culprits.update(found)
+    # A copy shares the fate of the signature it copies.
+    for c in copies:
+        if first[hashlib.sha256(items[c][1].to_bytes()).digest()] in traced:
+            traced.add(c)
+    copies = [c for c in copies if c not in traced]
+    return Classification(
+        accepted=[i for i in distinct if i not in traced],
+        rejected=sorted(traced),
+        culprits=sorted(culprits),
+        copies=copies,
+    )
